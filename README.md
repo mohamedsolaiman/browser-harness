@@ -1,28 +1,33 @@
 ---
-title: Browser Harness Content Automator
+title: Content Automation Studio
 emoji: 🎬
-colorFrom: blue
-colorTo: purple
+colorFrom: indigo
+colorTo: slate
 sdk: docker
 app_port: 7860
 pinned: false
 tags:
-  - automation
-  - video
-  - tts
-  - content-creation
+  - video-generation
+  - text-to-speech
+  - content-automation
   - youtube
-  - tiktok
   - social-media
-short_description: AI video creation and social media publishing pipeline
+short_description: AI-powered video creation and social media publishing
 ---
 
-# Browser Harness Content Automator
+# 🎬 Content Automation Studio
 
-Automated video creation pipeline:
-1. **AI Planning** — LLM generates scripts, scene plans, and publishing metadata
-2. **TTS Voiceover** — Mimo API converts scripts to natural speech
-3. **Video Composition** — ffmpeg assembles frames, titles, overlays, and audio into MP4
-4. **Social Media Publishing** — Upload to YouTube, TikTok, and X (Twitter)
+Automated video content creation and social media publishing pipeline:
 
-Enter a topic and hit "Create & Publish" — the system handles the rest.
+- **AI Planning** — Generate video scripts with scene-by-scene directions
+- **TTS Voiceover** — Convert scripts to natural speech via Mimo API
+- **Video Composition** — Assemble videos with titles, overlays, and audio
+- **Social Publishing** — Upload to YouTube, TikTok, and X/Twitter
+
+## Setup
+
+Add your secrets in Space Settings → Secrets:
+- `MIMO_API_KEY` — Required for TTS and AI planning
+- `YOUTUBE_ENABLED` — Set to `1` to enable YouTube publishing
+- `TIKTOK_ENABLED` — Set to `1` to enable TikTok publishing
+- `X_ENABLED` — Set to `1` to enable X/Twitter publishing
