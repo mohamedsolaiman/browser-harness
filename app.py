@@ -288,17 +288,39 @@ def check_status():
 
     # Quick connectivity test
     try:
-        from planner.planner import _api_request
+        import urllib.request
+        import urllib.error
         base_url = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
         api_key = os.environ.get("MIMO_API_KEY", "")
         if api_key:
-            data = _api_request(base_url, "models", api_key, {}, timeout=10)
-            models = [m.get("id", "?") for m in data.get("data", [])[:5]]
-            output += f"\n\n**API Connection**: ✅ Working! Available models: {', '.join(models)}"
+            test_url = f"{base_url.rstrip('/')}/models"
+            req = urllib.request.Request(
+                test_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                models = [m.get("id", "?") for m in data.get("data", [])[:5]]
+                output += f"\n\n**API Connection**: ✅ Working! Available models: {', '.join(models)}"
         else:
             output += "\n\n**API Connection**: ⚠️ No API key set, skipping connectivity test."
     except Exception as e:
-        output += f"\n\n**API Connection**: ❌ Failed — {str(e)[:200]}"
+        # Try requests library as fallback
+        try:
+            import requests as req_lib
+            resp = req_lib.get(
+                f"{base_url.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                models = [m.get("id", "?") for m in data.get("data", [])[:5]]
+                output += f"\n\n**API Connection**: ✅ Working (via requests)! Available models: {', '.join(models)}"
+            else:
+                output += f"\n\n**API Connection**: ❌ Failed — HTTP {resp.status_code}"
+        except Exception as e2:
+            output += f"\n\n**API Connection**: ❌ Failed — {str(e)[:150]}"
 
     return output
 
