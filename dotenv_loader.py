@@ -6,8 +6,6 @@ from pathlib import Path
 
 def load_secrets():
     """Load environment variables from .env file and HF Space secrets."""
-    # HF Spaces injects secrets as environment variables automatically.
-    # This loader handles the local .env file case for development.
     env_paths = [
         Path(__file__).parent / ".env",
         Path.cwd() / ".env",
@@ -22,9 +20,9 @@ def load_secrets():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-    # Set defaults for missing config
-    os.environ.setdefault("MIMO_BASE_URL", "https://api.mymimo.ai")
-    os.environ.setdefault("MIMO_TTS_MODEL", "mimo-tts-1")
-    os.environ.setdefault("PLANNER_MODEL", "gpt-4o-mini")
+    # Set correct defaults for MiMo API
+    os.environ.setdefault("MIMO_BASE_URL", "https://api.mimo-v2.com/v1")
+    os.environ.setdefault("MIMO_TTS_MODEL", "mimo-v2-tts")
+    os.environ.setdefault("PLANNER_MODEL", "mimo-v2-flash")
     os.environ.setdefault("BH_VIDEO_DIR", "/tmp/content-studio/videos")
     os.environ.setdefault("BH_PLAN_DIR", "/tmp/content-studio/plans")
