@@ -14,7 +14,7 @@ tags:
   - youtube
   - tiktok
   - social-media
-short_description: AI-powered video content creation and social media publishing pipeline
+short_description: AI video creation and social media publishing pipeline
 ---
 
 # Browser Harness Content Automator
