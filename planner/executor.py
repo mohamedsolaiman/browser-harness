@@ -128,7 +128,7 @@ class PlanExecutor:
             if not narration:
                 continue
 
-            output_path = str(VIDEO_OUTPUT_DIR / f"scene_{i:03d}.mp3")
+            output_path = str(VIDEO_OUTPUT_DIR / f"scene_{i:03d}.wav")
 
             print(f"  [tts] Generating audio for scene {i+1}/{len(scenes)}: {narration[:50]}...")
             try:
@@ -158,7 +158,7 @@ class PlanExecutor:
 
         # Concatenate all audio files into one
         if audio_files:
-            combined_audio = str(VIDEO_OUTPUT_DIR / "full_narration.mp3")
+            combined_audio = str(VIDEO_OUTPUT_DIR / "full_narration.wav")
             self._concatenate_audio_files(audio_files, combined_audio)
             self.artifacts["audio_files"] = audio_files
             self.artifacts["combined_audio"] = combined_audio

@@ -1,16 +1,15 @@
 """AI-driven content planner for automated video creation and publishing.
 
 Uses the Xiaomi MiMo API (OpenAI-compatible) for planning.
-Base URL: https://api.mimo-v2.com/v1
-Chat models: mimo-v2-pro, mimo-v2-flash
+Supports multiple base URLs with automatic fallback:
+  - https://api.xiaomimimo.com/v1  (primary)
+  - https://api.mimo-v2.com/v1     (fallback)
 
 All credentials from environment variables — never hard-coded.
 """
 
 import json
 import os
-import urllib.request
-import urllib.error
 from datetime import datetime
 from pathlib import Path
 
@@ -19,8 +18,69 @@ MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
 MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
 PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "mimo-v2-flash")
 
+# Fallback URLs to try if primary fails
+FALLBACK_BASE_URLS = [
+    "https://api.xiaomimimo.com/v1",
+    "https://api.mimo-v2.com/v1",
+]
+
 PLAN_OUTPUT_DIR = Path(os.environ.get("BH_PLAN_DIR", Path.home() / "browser-harness-plans"))
 PLAN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _api_request(base_url, endpoint, api_key, payload, timeout=120):
+    """Make an API request using the best available HTTP library.
+
+    Tries: openai SDK → requests → urllib (in that order)
+    Returns the parsed JSON response dict.
+    """
+    # Method 1: Try OpenAI SDK (most robust)
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url.rstrip("/"),
+            timeout=timeout,
+            max_retries=2,
+        )
+        if endpoint == "chat/completions":
+            response = client.chat.completions.create(**payload)
+            content = response.choices[0].message.content
+            return {"choices": [{"message": {"content": content}}]}
+    except ImportError:
+        pass
+    except Exception as e:
+        # If OpenAI SDK fails, fall through to requests
+        print(f"  [planner] OpenAI SDK failed ({e}), trying requests...")
+
+    # Method 2: Try requests library
+    try:
+        import requests
+        url = f"{base_url.rstrip('/')}/{endpoint}"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"API error (HTTP {resp.status_code}): {resp.text[:300]}")
+        return resp.json()
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"  [planner] requests failed ({e}), trying urllib...")
+
+    # Method 3: Fallback to urllib
+    import urllib.request
+    import urllib.error
+    url = f"{base_url.rstrip('/')}/{endpoint}"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read())
 
 
 class ContentPlanner:
@@ -29,6 +89,8 @@ class ContentPlanner:
     Uses chat completions at POST {base_url}/chat/completions
     Model: mimo-v2-flash (fast) or mimo-v2-pro (better reasoning)
     Auth: Authorization: Bearer <key>
+
+    Supports automatic URL fallback if the primary base URL is unreachable.
     """
 
     def __init__(self, api_key=None, base_url=None, model=None):
@@ -64,15 +126,43 @@ class ContentPlanner:
             topic, platforms, duration_minutes, style, language, extra_instructions
         )
 
-        response = self._chat(system_prompt, user_prompt)
+        response = self._chat_with_fallback(system_prompt, user_prompt)
         plan = self._parse_plan(response, topic, platforms)
         return plan
 
-    def _chat(self, system_prompt, user_prompt):
-        """Send a chat completion request to the MiMo API."""
-        url = f"{self.base_url}/chat/completions"
+    def _chat_with_fallback(self, system_prompt, user_prompt):
+        """Send a chat request, trying fallback URLs if primary fails."""
+        urls_to_try = [self.base_url] + [u for u in FALLBACK_BASE_URLS if u.rstrip("/") != self.base_url]
+        last_error = None
 
-        body = {
+        for url in urls_to_try:
+            try:
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.7,
+                    "max_completion_tokens": 4096,
+                }
+                data = _api_request(url, "chat/completions", self.api_key, payload, timeout=120)
+                content = data["choices"][0]["message"]["content"]
+                print(f"  [planner] API call succeeded using {url}")
+                return content
+            except Exception as e:
+                last_error = e
+                print(f"  [planner] Failed with {url}: {e}")
+                continue
+
+        raise RuntimeError(
+            f"All API URLs failed. Last error: {last_error}. "
+            f"Check MIMO_API_KEY and MIMO_BASE_URL settings."
+        )
+
+    def _chat(self, system_prompt, user_prompt):
+        """Send a chat completion request to the MiMo API (single URL)."""
+        payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -81,31 +171,8 @@ class ContentPlanner:
             "temperature": 0.7,
             "max_completion_tokens": 4096,
         }
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
-
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
-
-        try:
-            with urllib.request.urlopen(req, timeout=120) as response:
-                data = json.loads(response.read())
-                content = data["choices"][0]["message"]["content"]
-                return content
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode() if e.fp else "unknown"
-            raise RuntimeError(
-                f"MiMo API error (HTTP {e.code}): {error_body}. "
-                f"Check MIMO_API_KEY and MIMO_BASE_URL. "
-                f"URL: {url}, Model: {self.model}"
-            ) from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"Cannot reach MiMo API at {url}: {e.reason}. "
-                f"Check MIMO_BASE_URL. Current: {self.base_url}"
-            ) from e
+        data = _api_request(self.base_url, "chat/completions", self.api_key, payload)
+        return data["choices"][0]["message"]["content"]
 
     def _build_system_prompt(self, style, language):
         return f"""You are an expert content strategist and video producer. You create detailed, actionable content plans for automated video production.

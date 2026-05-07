@@ -4,8 +4,8 @@
 Deployed on Hugging Face Spaces. Provides a web interface to:
 1. Create content plans (AI scripts your video)
 2. Generate TTS voiceover
-4. Compose videos with browser screenshots/slides
-5. Publish to YouTube, TikTok, X (when enabled)
+3. Compose videos with browser screenshots/slides
+4. Publish to YouTube, TikTok, X (when enabled)
 
 All API keys stored as HF Space secrets — never exposed.
 
@@ -121,7 +121,7 @@ def generate_tts_audio(text, voice, speed):
 
     try:
         client = MimoTTS()
-        output_path = str(AUDIO_DIR / f"tts_{int(time.time())}.mp3")
+        output_path = str(AUDIO_DIR / f"tts_{int(time.time())}.wav")
         path = client.generate(
             text=text.strip(),
             voice=voice,
@@ -147,7 +147,7 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
 
     try:
         # Step 1: Plan
-        yield "🧠 **Step 1/4: Creating content plan...**\n\nConnecting to MiMo AI to generate script and visual directions...", None, None, None
+        yield "🧠 **Step 1/4: Creating content plan...**\n\nConnecting to MiMo AI to generate script and visual directions...\n\n⏳ This may take 30-60 seconds depending on the topic.", None, None, None
 
         planner = ContentPlanner()
         plan = planner.plan(
@@ -163,7 +163,7 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
         plan_summary = f"**{plan.get('title', 'Untitled')}** — {len(scenes)} scenes, ~{plan.get('duration_estimate_seconds', '?')}s"
 
         # Step 2: TTS
-        yield f"🎙️ **Step 2/4: Generating voiceover...**\n\nPlan: {plan_summary}\n\nGenerating TTS audio for {len(scenes)} scenes using MiMo TTS...", None, None, None
+        yield f"🎙️ **Step 2/4: Generating voiceover...**\n\nPlan: {plan_summary}\n\nGenerating TTS audio for {len(scenes)} scenes using MiMo TTS...\n\n⏳ Each scene takes ~10 seconds.", None, None, None
 
         executor = PlanExecutor(plan=plan, tts_voice=tts_voice, video_resolution=resolution)
 
@@ -233,7 +233,12 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
         yield result_text, final_video, combined_audio, subtitle_file
 
     except Exception as e:
-        yield f"❌ Pipeline failed: {e}\n\n```\n{traceback.format_exc()[-1000:]}\n```", None, None, None
+        error_msg = f"❌ Pipeline failed: {e}"
+        # Don't include huge tracebacks that could crash Gradio
+        tb = traceback.format_exc()
+        if len(tb) > 500:
+            tb = tb[-500:]
+        yield f"{error_msg}\n\n```\n{tb}\n```", None, None, None
 
 
 def load_and_show_plan(plan_path):
@@ -283,17 +288,17 @@ def check_status():
 
     # Quick connectivity test
     try:
-        import urllib.request
-        req = urllib.request.Request(
-            os.environ.get("MIMO_BASE_URL", "https://api.mimo-v2.com/v1").rstrip("/") + "/models",
-            headers={"Authorization": f"Bearer {os.environ.get('MIMO_API_KEY', '')}"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+        from planner.planner import _api_request
+        base_url = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
+        api_key = os.environ.get("MIMO_API_KEY", "")
+        if api_key:
+            data = _api_request(base_url, "models", api_key, {}, timeout=10)
             models = [m.get("id", "?") for m in data.get("data", [])[:5]]
             output += f"\n\n**API Connection**: ✅ Working! Available models: {', '.join(models)}"
+        else:
+            output += "\n\n**API Connection**: ⚠️ No API key set, skipping connectivity test."
     except Exception as e:
-        output += f"\n\n**API Connection**: ❌ Failed — {str(e)[:100]}"
+        output += f"\n\n**API Connection**: ❌ Failed — {str(e)[:200]}"
 
     return output
 

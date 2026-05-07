@@ -1,8 +1,9 @@
 FROM python:3.11-slim
 
-# Install system dependencies
+# Install system dependencies (curl for health check + ffmpeg for video)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -21,8 +22,8 @@ RUN mkdir -p /tmp/content-studio/videos /tmp/content-studio/plans /tmp/content-s
 # Expose Gradio port
 EXPOSE 7860
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s \
+# Health check (curl is now installed)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:7860/ || exit 1
 
 # Run the app
