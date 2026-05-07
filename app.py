@@ -10,8 +10,8 @@ Deployed on Hugging Face Spaces. Provides a web interface to:
 All API keys stored as HF Space secrets — never exposed.
 
 API: Xiaomi MiMo (OpenAI-compatible)
-- Chat: https://api.mimo-v2.com/v1/chat/completions
-- TTS:  https://api.mimo-v2.com/v1/audio/speech
+- Chat: https://api.xiaomimimo.com/v1/chat/completions
+- TTS:  https://api.xiaomimimo.com/v1/chat/completions (model: mimo-v2-tts)
 """
 
 import os
@@ -354,8 +354,8 @@ with gr.Blocks(
                     )
                     with gr.Row():
                         pipe_voice = gr.Dropdown(
-                            ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
-                            value="alloy", label="TTS Voice"
+                            ["mimo_default", "default_zh", "default_en"],
+                            value="mimo_default", label="TTS Voice"
                         )
                         pipe_resolution = gr.Dropdown(
                             ["720p", "1080p", "4k"],
@@ -422,7 +422,7 @@ with gr.Blocks(
 
         # ── Tab 3: TTS Only ──
         with gr.Tab("🎙️ Text to Speech"):
-            gr.Markdown("### Generate voiceover audio with MiMo TTS\n> Model: `mimo-v2-tts` | Endpoint: `api.mimo-v2.com/v1/audio/speech`")
+            gr.Markdown("### Generate voiceover audio with MiMo TTS\n> Model: `mimo-v2-tts` | Uses chat completions endpoint with audio output")
             with gr.Row():
                 with gr.Column():
                     tts_text = gr.Textbox(
@@ -432,8 +432,8 @@ with gr.Blocks(
                     )
                     with gr.Row():
                         tts_voice = gr.Dropdown(
-                            ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
-                            value="alloy", label="Voice"
+                            ["mimo_default", "default_zh", "default_en"],
+                            value="mimo_default", label="Voice"
                         )
                         tts_speed = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label="Speed")
                     tts_btn = gr.Button("🎙️ Generate Speech", variant="primary")
@@ -470,7 +470,7 @@ with gr.Blocks(
             | Secret | Required | Description |
             |--------|----------|-------------|
             | `MIMO_API_KEY` | ✅ | MiMo API key for TTS and LLM planning |
-            | `MIMO_BASE_URL` | No | API base URL (default: `https://api.mimo-v2.com/v1`) |
+            | `MIMO_BASE_URL` | No | API base URL (default: `https://api.xiaomimimo.com/v1`) |
             | `MIMO_TTS_MODEL` | No | TTS model (default: `mimo-v2-tts`) |
             | `PLANNER_MODEL` | No | LLM model for planning (default: `mimo-v2-flash`) |
             | `YOUTUBE_ENABLED` | No | Set `1` to enable YouTube publishing |

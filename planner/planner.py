@@ -16,7 +16,7 @@ from pathlib import Path
 
 # Configuration
 MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
-MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.mimo-v2.com/v1")
+MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
 PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "mimo-v2-flash")
 
 PLAN_OUTPUT_DIR = Path(os.environ.get("BH_PLAN_DIR", Path.home() / "browser-harness-plans"))

@@ -20,8 +20,8 @@ def load_secrets():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-    # Set correct defaults for MiMo API
-    os.environ.setdefault("MIMO_BASE_URL", "https://api.mimo-v2.com/v1")
+    # Set correct defaults for Xiaomi MiMo API
+    os.environ.setdefault("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
     os.environ.setdefault("MIMO_TTS_MODEL", "mimo-v2-tts")
     os.environ.setdefault("PLANNER_MODEL", "mimo-v2-flash")
     os.environ.setdefault("BH_VIDEO_DIR", "/tmp/content-studio/videos")

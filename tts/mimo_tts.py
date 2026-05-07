@@ -1,19 +1,25 @@
-"""Mimo TTS client — Xiaomi MiMo text-to-speech API.
+"""Xiaomi MiMo TTS client — chat completions-based text-to-speech API.
 
-API documentation: https://www.mimo-v2.com/docs/usage-guide/tts
-OpenAI-compatible endpoint at https://api.mimo-v2.com/v1
+API documentation: https://platform.xiaomimimo.com/docs/en-US/usage-guide/speech-synthesis
 
-Reads MIMO_API_KEY from environment variables (or .env file).
-Never hard-code API keys.
+IMPORTANT: MiMo TTS uses the CHAT COMPLETIONS endpoint, NOT /audio/speech.
+- Endpoint: POST https://api.xiaomimimo.com/v1/chat/completions
+- Model: mimo-v2-tts
+- The text goes in messages (user/assistant role)
+- Audio config goes in the "audio" parameter: {"format": "wav", "voice": "mimo_default"}
+- Audio comes back as base64 in response.choices[0].message.audio.data
 
-Usage with browser-harness -c:
-    browser-harness -c '
-    from tts import generate_speech
-    path = generate_speech("Welcome to my channel!", voice="alloy")
-    print(f"Audio saved: {path}")
-    '
+Available voices:
+  - mimo_default (MiMo-Default)
+  - default_zh (MiMo-Chinese Female)
+  - default_en (MiMo-English Female)
+
+Available formats: wav, pcm16 (for streaming)
+
+Reads MIMO_API_KEY from environment variables — never hard-coded.
 """
 
+import base64
 import json
 import os
 import subprocess
@@ -23,9 +29,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-# Configuration — all from environment variables, never hard-coded
+# Configuration
 MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
-MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.mimo-v2.com/v1")
+MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
 MIMO_TTS_MODEL = os.environ.get("MIMO_TTS_MODEL", "mimo-v2-tts")
 
 # Output directory
@@ -34,19 +40,23 @@ TTS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class MimoTTS:
-    """Client for the Xiaomi MiMo TTS API (OpenAI-compatible endpoint).
+    """Client for the Xiaomi MiMo TTS API (chat completions-based).
 
-    API docs: https://www.mimo-v2.com/docs/usage-guide/tts
+    The MiMo TTS API uses the chat completions endpoint with an "audio" parameter.
+    Text to speak goes in the messages array, and the audio comes back as base64
+    in the response message's audio.data field.
 
-    Endpoint: POST https://api.mimo-v2.com/v1/audio/speech
+    Auth: api-key header OR Authorization: Bearer header
+    Endpoint: POST {base_url}/chat/completions
     Model: mimo-v2-tts
-    Auth: api-key header or Authorization: Bearer
-
-    All credentials come from environment variables:
-      - MIMO_API_KEY: API key for the TTS service
-      - MIMO_BASE_URL: Base URL (default: https://api.mimo-v2.com/v1)
-      - MIMO_TTS_MODEL: Model name (default: mimo-v2-tts)
     """
+
+    # Available voices
+    VOICES = {
+        "mimo_default": "MiMo-Default",
+        "default_zh": "MiMo-Chinese Female",
+        "default_en": "MiMo-English Female",
+    }
 
     def __init__(self, api_key=None, base_url=None, model=None):
         self.api_key = api_key or MIMO_API_KEY
@@ -59,32 +69,44 @@ class MimoTTS:
                 "Never commit API keys to the repository."
             )
 
-    def generate(self, text, voice="alloy", output_path=None, response_format="mp3",
-                 speed=1.0):
-        """Generate speech from text.
+    def generate(self, text, voice="mimo_default", output_path=None, response_format="wav",
+                 speed=1.0, style=None):
+        """Generate speech from text using MiMo TTS via chat completions.
 
         Args:
             text: Text to convert to speech.
-            voice: Voice to use (alloy, echo, fable, onyx, nova, shimmer, etc.).
+            voice: Voice to use (mimo_default, default_zh, default_en).
             output_path: Path for the output audio file. Auto-generated if None.
-            response_format: Audio format ("mp3", "opus", "aac", "flac", "wav", "pcm").
-            speed: Speech speed (0.25 to 4.0, default 1.0).
+            response_format: Audio format ("wav", "pcm16").
+            speed: Speech speed hint (used as style if <1 or >1).
+            style: Optional style string (e.g. "Happy", "Whisper", "Angry").
 
         Returns:
             Path to the saved audio file.
         """
         if len(text) > 4096:
-            return self._generate_long_text(text, voice, output_path, response_format, speed)
+            return self._generate_long_text(text, voice, output_path, response_format, speed, style)
 
-        # Build URL — base_url already includes /v1
-        url = f"{self.base_url}/audio/speech"
+        url = f"{self.base_url}/chat/completions"
+
+        # Build the message content with optional style tag
+        content = text
+        if style:
+            content = f"<style>{style}</style>{text}"
+        if speed < 0.8:
+            content = f"<style>Slow down</style>{content}"
+        elif speed > 1.2:
+            content = f"<style>Speed up</style>{content}"
 
         body = {
             "model": self.model,
-            "input": text,
-            "voice": voice,
-            "response_format": response_format,
-            "speed": speed,
+            "messages": [
+                {"role": "user", "content": content},
+            ],
+            "audio": {
+                "format": response_format,
+                "voice": voice,
+            },
         }
 
         headers = {
@@ -94,53 +116,109 @@ class MimoTTS:
 
         if output_path is None:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output_path = str(TTS_OUTPUT_DIR / f"tts_{timestamp}.{response_format}")
+            ext = "wav" if response_format in ("wav", "pcm16") else response_format
+            output_path = str(TTS_OUTPUT_DIR / f"tts_{timestamp}.{ext}")
 
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
 
         try:
             with urllib.request.urlopen(req, timeout=60) as response:
-                audio_data = response.read()
+                data = json.loads(response.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode() if e.fp else "unknown"
             raise RuntimeError(
-                f"Mimo TTS API error (HTTP {e.code}): {error_body}. "
-                f"Check your MIMO_API_KEY and MIMO_BASE_URL settings."
+                f"MiMo TTS API error (HTTP {e.code}): {error_body}. "
+                f"Check your MIMO_API_KEY and MIMO_BASE_URL settings. "
+                f"URL: {url}"
             ) from e
         except urllib.error.URLError as e:
             raise RuntimeError(
-                f"Cannot reach Mimo API at {url}: {e.reason}. "
-                f"Check your internet connection and MIMO_BASE_URL setting. "
-                f"Current base URL: {self.base_url}"
+                f"Cannot reach MiMo API at {url}: {e.reason}. "
+                f"Check your MIMO_BASE_URL setting. Current: {self.base_url}"
             ) from e
 
-        if len(audio_data) < 100:
-            raise RuntimeError(
-                f"Mimo TTS returned suspiciously small response ({len(audio_data)} bytes). "
-                f"The API key may be invalid or the service may be down."
-            )
+        # Extract audio from the response
+        try:
+            choices = data.get("choices", [])
+            if not choices:
+                raise RuntimeError(f"No choices in TTS response. Full response: {json.dumps(data)[:500]}")
 
-        with open(output_path, "wb") as f:
-            f.write(audio_data)
+            message = choices[0].get("message", {})
+            audio_data = message.get("audio", {}).get("data")
+
+            if not audio_data:
+                # Check if there's text content (might be an error)
+                text_content = message.get("content", "")
+                raise RuntimeError(
+                    f"No audio data in TTS response. Message content: {text_content[:200]}. "
+                    f"Full response: {json.dumps(data)[:500]}"
+                )
+
+            # Decode base64 audio
+            audio_bytes = base64.b64decode(audio_data)
+
+            if len(audio_bytes) < 100:
+                raise RuntimeError(f"Suspiciously small audio response ({len(audio_bytes)} bytes)")
+
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"Unexpected TTS response format: {e}. Response: {json.dumps(data)[:500]}") from e
+
+        # Handle PCM16 format — needs conversion to WAV
+        if response_format == "pcm16":
+            output_path = self._pcm16_to_wav(audio_bytes, output_path)
+        else:
+            with open(output_path, "wb") as f:
+                f.write(audio_bytes)
 
         return output_path
 
-    def _generate_long_text(self, text, voice, output_path, response_format, speed):
+    def _pcm16_to_wav(self, pcm_data, output_path):
+        """Convert raw PCM16 data to a WAV file using ffmpeg."""
+        # Write raw PCM first
+        raw_path = output_path.rsplit(".", 1)[0] + ".pcm"
+        with open(raw_path, "wb") as f:
+            f.write(pcm_data)
+
+        # Convert to WAV with ffmpeg (PCM16LE, 24kHz, mono — MiMo TTS spec)
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "s16le", "-ar", "24000", "-ac", "1",
+            "-i", raw_path,
+            wav_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            # If ffmpeg fails, save raw PCM and hope for the best
+            with open(output_path, "wb") as f:
+                f.write(pcm_data)
+        else:
+            output_path = wav_path
+
+        # Cleanup raw file
+        try:
+            os.unlink(raw_path)
+        except Exception:
+            pass
+
+        return output_path
+
+    def _generate_long_text(self, text, voice, output_path, response_format, speed, style):
         """Generate speech for text longer than 4096 characters by splitting into chunks."""
         chunks = self._split_text(text, max_length=3800)
         chunk_paths = []
 
         for i, chunk in enumerate(chunks):
-            chunk_path = tempfile.mktemp(suffix=f".{response_format}")
+            chunk_path = tempfile.mktemp(suffix=f".wav")
             path = self.generate(
                 chunk, voice=voice, output_path=chunk_path,
-                response_format=response_format, speed=speed,
+                response_format=response_format, speed=speed, style=style,
             )
             chunk_paths.append(path)
 
         if output_path is None:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output_path = str(TTS_OUTPUT_DIR / f"tts_{timestamp}.{response_format}")
+            output_path = str(TTS_OUTPUT_DIR / f"tts_{timestamp}.wav")
 
         return self._concatenate_audio(chunk_paths, output_path)
 
@@ -191,36 +269,33 @@ class MimoTTS:
         return output_path
 
     def list_voices(self):
-        """List available voices. Returns the default Mimo TTS voice list."""
+        """List available TTS voices."""
         return [
-            {"id": "alloy", "name": "Alloy"},
-            {"id": "echo", "name": "Echo"},
-            {"id": "fable", "name": "Fable"},
-            {"id": "onyx", "name": "Onyx"},
-            {"id": "nova", "name": "Nova"},
-            {"id": "shimmer", "name": "Shimmer"},
+            {"id": "mimo_default", "name": "MiMo-Default"},
+            {"id": "default_zh", "name": "MiMo-Chinese Female"},
+            {"id": "default_en", "name": "MiMo-English Female"},
         ]
 
 
-# --- Module-level convenience functions ---
+# --- Module-level convenience ---
 
-def generate_speech(text, voice="alloy", output_path=None, speed=1.0):
-    """Generate speech from text using Mimo TTS.
+def generate_speech(text, voice="mimo_default", output_path=None, speed=1.0, style=None):
+    """Generate speech from text using MiMo TTS.
 
     Args:
         text: Text to convert to speech.
-        voice: Voice ID.
+        voice: Voice ID (mimo_default, default_zh, default_en).
         output_path: Output file path. Auto-generated if None.
-        speed: Speech speed (0.25–4.0).
+        speed: Speech speed hint.
+        style: Optional style string (Happy, Whisper, Angry, etc.).
 
     Returns:
         Path to the saved audio file.
     """
     client = MimoTTS()
-    return client.generate(text, voice=voice, output_path=output_path, speed=speed)
+    return client.generate(text, voice=voice, output_path=output_path, speed=speed, style=style)
 
 
 def list_voices():
     """List available TTS voices."""
-    client = MimoTTS()
-    return client.list_voices()
+    return MimoTTS.VOICES
