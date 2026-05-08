@@ -4,8 +4,8 @@
 Deployed on Hugging Face Spaces. Provides a web interface to:
 1. Create content plans (AI scripts your video)
 2. Generate TTS voiceover
-3. Generate AI images for each scene (Pollinations.ai)
-4. Compose dynamic videos with Ken Burns effects and transitions
+3. Download stock video footage (Pexels/Pixabay) or generate AI images
+4. Compose dynamic videos with transitions and voiceover
 5. Publish to YouTube, TikTok, X (when enabled)
 
 All API keys stored as HF Space secrets — never exposed.
@@ -14,8 +14,8 @@ API: Xiaomi MiMo (OpenAI-compatible)
 - Chat: https://api.xiaomimimo.com/v1/chat/completions
 - TTS:  https://api.xiaomimimo.com/v1/chat/completions (model: mimo-v2-tts)
 
-Image Generation: Pollinations.ai (free, no API key)
-Stock Video: Pexels API (optional, requires PEXELS_API_KEY)
+Stock Video: Pexels API + Pixabay API (free API keys)
+Image Generation: Pollinations.ai (free, no API key — fallback)
 """
 
 import os
@@ -43,7 +43,7 @@ def _ensure_modules():
     from planner.planner import ContentPlanner
     from planner.executor import PlanExecutor
     from tts.mimo_tts import MimoTTS, generate_speech
-    from video.editor import compose_video, create_dynamic_video, generate_srt
+    from video.editor import compose_video, create_dynamic_video, create_stock_video, generate_srt
     from visuals.image_gen import generate_image, generate_scene_images, enhance_prompt
     from visuals.stock_video import search_stock_videos, download_stock_video, get_videos_for_topic
     _modules_loaded = True
@@ -217,20 +217,20 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
                 None, None, None
             )
 
-        # Step 3: Generate AI images
+        # Step 3: Generate visuals (stock videos / AI images)
         visual_mode_label = {
-            "ai_images": "AI-Generated Images (Pollinations.ai)",
-            "stock_videos": "Stock Videos (Pexels)",
-            "ai_plus_stock": "AI Images + Stock Videos",
+            "stock_videos": "Stock Videos (Pexels/Pixabay — dynamic footage)",
+            "ai_images": "AI-Generated Images (Pollinations.ai — static with Ken Burns)",
+            "ai_plus_stock": "Stock Videos + AI Images (best of both)",
         }.get(visual_mode, visual_mode)
 
         yield (
-            f"🎨 **Step 3/4: Generating visuals...**\n\n"
+            f"🎬 **Step 3/4: Generating visuals...**\n\n"
             f"Plan: {plan_summary}\n\n"
             f"Mode: {visual_mode_label}\n"
             f"Style: {visual_style}\n\n"
-            f"Generating images for {len(scenes)} scenes using Pollinations.ai (free)...\n\n"
-            f"⏳ Each image takes ~15-30 seconds.",
+            f"{'Downloading stock footage for' if 'stock' in visual_mode else 'Generating AI images for'} {len(scenes)} scenes...\n\n"
+            f"⏳ {'Each video takes ~10-20 seconds to download' if 'stock' in visual_mode else 'Each image takes ~15-30 seconds'}.",
             None, None, None
         )
 
@@ -238,9 +238,12 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
             executor._step_visuals()
             img_ok = sum(1 for p in executor.artifacts.get("image_files", []) if p is not None)
             vid_ok = sum(1 for p in executor.artifacts.get("stock_videos", []) if p is not None)
-            visual_info = f"Images: {img_ok}/{len(scenes)}"
             if vid_ok > 0:
-                visual_info += f" | Stock videos: {vid_ok}"
+                visual_info = f"Stock videos: {vid_ok}/{len(scenes)}"
+                if img_ok > 0:
+                    visual_info += f" | AI images: {img_ok} (fallback)"
+            else:
+                visual_info = f"AI images: {img_ok}/{len(scenes)}"
             yield (
                 f"✅ Visuals complete: {visual_info}\n\n"
                 f"Moving to video composition...",
@@ -363,6 +366,7 @@ def check_status():
         "MIMO_API_KEY": bool(os.environ.get("MIMO_API_KEY")),
         "MIMO_BASE_URL": os.environ.get("MIMO_BASE_URL", "not set (using default)"),
         "PEXELS_API_KEY": bool(os.environ.get("PEXELS_API_KEY")),
+        "PIXABAY_API_KEY": bool(os.environ.get("PIXABAY_API_KEY")),
         "YOUTUBE_ENABLED": bool(os.environ.get("YOUTUBE_ENABLED")),
         "TIKTOK_ENABLED": bool(os.environ.get("TIKTOK_ENABLED")),
         "X_ENABLED": bool(os.environ.get("X_ENABLED")),
@@ -370,7 +374,10 @@ def check_status():
     output = "### 🔍 System Status\n\n"
     output += f"- **Mimo API Key**: {'✅ Set' if keys['MIMO_API_KEY'] else '❌ Missing — set MIMO_API_KEY in Space Secrets'}\n"
     output += f"- **Mimo Base URL**: `{keys['MIMO_BASE_URL']}`\n"
-    output += f"- **Pexels API Key**: {'✅ Set — stock videos available' if keys['PEXELS_API_KEY'] else '⚪ Not set — AI images only (free)'}\n"
+    output += f"- **Pexels API Key**: {'✅ Set — stock videos available' if keys['PEXELS_API_KEY'] else '⚪ Not set'}\n"
+    output += f"- **Pixabay API Key**: {'✅ Set — more stock videos available' if keys['PIXABAY_API_KEY'] else '⚪ Not set'}\n"
+    if not keys['PEXELS_API_KEY'] and not keys['PIXABAY_API_KEY']:
+        output += "  ⚠️ **Neither key set — will fall back to AI images (static). Get free keys at [Pexels](https://pexels.com/api) and/or [Pixabay](https://pixabay.com/api/docs)**\n"
     output += f"- **YouTube Publishing**: {'✅ Enabled' if keys['YOUTUBE_ENABLED'] else '⚪ Disabled'}\n"
     output += f"- **TikTok Publishing**: {'✅ Enabled' if keys['TIKTOK_ENABLED'] else '⚪ Disabled'}\n"
     output += f"- **X/Twitter Publishing**: {'✅ Enabled' if keys['X_ENABLED'] else '⚪ Disabled'}\n"
@@ -443,19 +450,19 @@ with gr.Blocks(
 
     gr.Markdown("""
     # 🎬 Content Automation Studio
-    **AI-powered video creation with cinematic visuals, voiceover, and dynamic composition.**
+    **AI-powered video creation with stock footage, voiceover, and dynamic composition.**
 
-    > 🖼️ **AI Images** by [Pollinations.ai](https://pollinations.ai) (free, no API key) •
-    > 🎙️ **Voiceover** by Xiaomi MiMo TTS •
-    > 🎥 **Stock Video** by Pexels (optional)
+    > 🎥 **Stock Videos** by [Pexels](https://pexels.com/api) + [Pixabay](https://pixabay.com/api/docs) (free API keys) •
+    > 🖼️ **AI Images** by [Pollinations.ai](https://pollinations.ai) (free, fallback) •
+    > 🎙️ **Voiceover** by Xiaomi MiMo TTS
 
-    Create stunning videos in 4 steps: **Plan → TTS → AI Visuals → Compose**
+    Create stunning videos in 4 steps: **Plan → TTS → Dynamic Visuals → Compose**
     """)
 
     with gr.Tabs():
         # ── Tab 1: Full Pipeline ──
         with gr.Tab("🚀 Full Pipeline"):
-            gr.Markdown("### End-to-end: Plan → TTS → AI Visuals → Dynamic Video")
+            gr.Markdown("### End-to-end: Plan → TTS → Stock Footage/AI Visuals → Dynamic Video")
             with gr.Row():
                 with gr.Column(scale=2):
                     pipe_topic = gr.Textbox(
@@ -498,8 +505,8 @@ with gr.Blocks(
                             value="cinematic", label="🖼️ Visual Style"
                         )
                         pipe_visual_mode = gr.Dropdown(
-                            ["ai_images", "stock_videos", "ai_plus_stock"],
-                            value="ai_images", label="🎥 Visual Source"
+                            ["stock_videos", "ai_plus_stock", "ai_images"],
+                            value="stock_videos", label="🎥 Visual Source"
                         )
                     pipe_publish = gr.Checkbox(value=False, label="Enable Publishing (requires browser session)")
 
@@ -653,7 +660,8 @@ with gr.Blocks(
             | `MIMO_BASE_URL` | No | API base URL (default: `https://api.xiaomimimo.com/v1`) |
             | `MIMO_TTS_MODEL` | No | TTS model (default: `mimo-v2-tts`) |
             | `PLANNER_MODEL` | No | LLM model for planning (default: `mimo-v2-flash`) |
-            | `PEXELS_API_KEY` | No | Pexels API key for stock video (free at pexels.com/api) |
+            | `PEXELS_API_KEY` | Recommended | Pexels API key for stock video (free at pexels.com/api) |
+            | `PIXABAY_API_KEY` | Recommended | Pixabay API key for more stock video (free at pixabay.com/api/docs) |
             | `YOUTUBE_ENABLED` | No | Set `1` to enable YouTube publishing |
             | `TIKTOK_ENABLED` | No | Set `1` to enable TikTok publishing |
             | `X_ENABLED` | No | Set `1` to enable X/Twitter publishing |
@@ -662,9 +670,13 @@ with gr.Blocks(
 
             | Mode | Description | API Key Required |
             |------|-------------|------------------|
-            | **AI Images** | Generate cinematic images with Pollinations.ai | ❌ Free, no key |
-            | **Stock Videos** | Download stock footage from Pexels | ✅ PEXELS_API_KEY |
-            | **AI + Stock** | Both AI images and stock footage | Pexels optional |
+            | **Stock Videos** | Download dynamic stock footage from Pexels/Pixabay | ✅ Pexels and/or Pixabay key |
+            | **AI + Stock** | Stock footage with AI image fallback | Pexels/Pixabay recommended |
+            | **AI Images** | Generate cinematic images with Pollinations.ai | ❌ Free, no key (static visuals) |
+
+            **Tip**: For dynamic, professional-looking videos, use **Stock Videos** mode. Get free API keys at:
+            - [Pexels API](https://pexels.com/api) — Free, instant signup
+            - [Pixabay API](https://pixabay.com/api/docs) — Free, instant signup
             """)
 
             status_btn = gr.Button("🔍 Check Status & API Connection", variant="primary")

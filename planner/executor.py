@@ -1,10 +1,10 @@
-"""Plan executor — orchestrates video creation with AI visuals, TTS, and dynamic composition.
+"""Plan executor — orchestrates video creation with stock footage, AI visuals, TTS, and dynamic composition.
 
 Takes a content plan (from planner.py) and executes it step by step:
 1. Generate TTS audio for each scene
-2. Generate AI images for each scene (using Pollinations.ai)
-2b. Optionally download stock videos (if PEXELS_API_KEY is set)
-3. Compose dynamic video with Ken Burns + transitions
+2. Download stock videos (Pexels/Pixabay) — PRIMARY visual mode
+2b. Generate AI images for scenes without stock footage — FALLBACK
+3. Compose dynamic video with transitions and voiceover
 4. Publish to YouTube, TikTok, and X (when enabled)
 
 All credentials from environment variables — never hard-coded.
@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from tts.mimo_tts import MimoTTS, generate_speech
 from video.editor import (
-    create_dynamic_video, generate_srt, create_gradient_placeholder, compose_video
+    create_dynamic_video, create_stock_video, generate_srt,
+    create_gradient_placeholder, compose_video
 )
 from visuals.image_gen import generate_scene_images, generate_image, enhance_prompt
 from visuals.stock_video import get_videos_for_topic
@@ -34,16 +35,21 @@ IMAGE_OUTPUT_DIR = Path(os.environ.get("CS_IMAGE_DIR", "/tmp/content-studio/imag
 
 
 class PlanExecutor:
-    """Executes a content plan: generates TTS, AI images, composes dynamic video, and publishes.
+    """Executes a content plan: generates TTS, stock footage, composes dynamic video, and publishes.
 
     The executor is designed to run step by step, with each step producing
     artifacts that the next step consumes. All steps have robust error handling
     and fallbacks — the executor should never crash.
+
+    Visual modes:
+    - "stock_videos": Primary — download free stock footage from Pexels/Pixabay
+    - "ai_images": Fallback — generate AI images with Pollinations.ai
+    - "ai_plus_stock": Use stock where available, AI images as fallback
     """
 
     def __init__(self, plan=None, plan_path=None, tts_voice="mimo_default",
                  video_resolution="720p", visual_style="cinematic",
-                 visual_mode="ai_images"):
+                 visual_mode="stock_videos"):
         """Initialize the executor.
 
         Args:
@@ -52,7 +58,7 @@ class PlanExecutor:
             tts_voice: Default TTS voice to use.
             video_resolution: Output video resolution.
             visual_style: Visual style for image generation.
-            visual_mode: Visual source mode ("ai_images", "stock_videos", "ai_plus_stock").
+            visual_mode: Visual source mode ("stock_videos", "ai_images", "ai_plus_stock").
         """
         if plan is not None:
             self.plan = plan
@@ -183,7 +189,6 @@ class PlanExecutor:
                 self.artifacts["combined_audio"] = combined_audio
             except Exception as e:
                 print(f"  [tts] WARNING: Audio concatenation failed: {e}")
-                # Use first audio file if concatenation fails
                 if audio_files:
                     self.artifacts["combined_audio"] = audio_files[0]
                     self.artifacts["audio_files"] = audio_files
@@ -200,105 +205,150 @@ class PlanExecutor:
                 print(f"  [tts] WARNING: SRT generation failed: {e}")
 
     def _step_visuals(self, **kwargs):
-        """Generate AI images for each scene and optionally download stock videos.
+        """Generate visual assets for each scene.
 
         Visual modes:
-        - "ai_images": Generate images using Pollinations.ai only
-        - "stock_videos": Download stock videos from Pexels only
-        - "ai_plus_stock": Both AI images and stock videos
+        - "stock_videos": PRIMARY — Download free stock footage from Pexels/Pixabay
+        - "ai_images": FALLBACK — Generate AI images using Pollinations.ai
+        - "ai_plus_stock": Both stock footage and AI images
+
+        Stock videos are prioritized because they look dynamic and professional.
+        AI images are used as fallback for scenes where stock footage isn't found.
         """
         scenes = self.plan.get("scenes", [])
         if not scenes:
             raise RuntimeError("Plan has no scenes")
 
-        # Step 2a: Generate AI images
-        if self.visual_mode in ("ai_images", "ai_plus_stock"):
-            print(f"  [visuals] Generating AI images for {len(scenes)} scenes (style: {self.visual_style})...")
-            try:
-                image_paths = generate_scene_images(
-                    scenes=scenes,
-                    output_dir=str(IMAGE_OUTPUT_DIR),
-                    style=self.visual_style,
-                )
-                self.artifacts["image_files"] = image_paths
-                success = sum(1 for p in image_paths if p is not None)
-                print(f"  [visuals] Generated {success}/{len(scenes)} AI images")
-            except Exception as e:
-                print(f"  [visuals] WARNING: AI image generation failed: {e}")
-                # Create gradient placeholders for all scenes
-                self.artifacts["image_files"] = self._create_all_placeholders(scenes)
+        topic = self.plan.get("topic", self.plan.get("title", ""))
+        pexels_key = os.environ.get("PEXELS_API_KEY", "")
+        pixabay_key = os.environ.get("PIXABAY_API_KEY", "")
 
-        # Step 2b: Optionally download stock videos
+        # ── Step 1: Try stock videos (PRIMARY) ──
         if self.visual_mode in ("stock_videos", "ai_plus_stock"):
-            pexels_key = os.environ.get("PEXELS_API_KEY", "")
-            if pexels_key:
-                topic = self.plan.get("topic", self.plan.get("title", ""))
+            if pexels_key or pixabay_key:
                 print(f"  [visuals] Downloading stock videos for topic: {topic}")
                 try:
                     stock_paths = get_videos_for_topic(
                         topic=topic,
                         scenes=scenes,
-                        api_key=pexels_key,
+                        max_videos=len(scenes),
                     )
                     self.artifacts["stock_videos"] = stock_paths
+                    stock_count = sum(1 for p in stock_paths if p is not None)
+                    print(f"  [visuals] Downloaded {stock_count}/{len(scenes)} stock videos")
                 except Exception as e:
                     print(f"  [visuals] WARNING: Stock video download failed: {e}")
             else:
-                print("  [visuals] No PEXELS_API_KEY set, skipping stock videos")
+                print("  [visuals] No PEXELS_API_KEY or PIXABAY_API_KEY set for stock videos")
                 if self.visual_mode == "stock_videos":
-                    # Stock-only mode but no API key — fall back to AI images
                     print("  [visuals] Falling back to AI image generation...")
-                    try:
-                        image_paths = generate_scene_images(
-                            scenes=scenes,
-                            output_dir=str(IMAGE_OUTPUT_DIR),
-                            style=self.visual_style,
-                        )
+                    self.visual_mode = "ai_images"
+
+        # ── Step 2: Generate AI images (FALLBACK or additional) ──
+        if self.visual_mode in ("ai_images", "ai_plus_stock"):
+            # In "ai_plus_stock" mode, only generate images for scenes without stock video
+            scenes_needing_images = scenes
+            if self.visual_mode == "ai_plus_stock" and self.artifacts.get("stock_videos"):
+                # Find scene indices that don't have stock videos
+                stock_vids = self.artifacts["stock_videos"]
+                missing_indices = [i for i in range(len(scenes)) if i >= len(stock_vids) or stock_vids[i] is None]
+                if missing_indices:
+                    print(f"  [visuals] Generating AI images for {len(missing_indices)} scenes without stock video")
+                    scenes_for_images = [scenes[i] for i in missing_indices]
+                else:
+                    scenes_for_images = []
+            else:
+                scenes_for_images = scenes
+
+            if scenes_for_images:
+                print(f"  [visuals] Generating AI images for {len(scenes_for_images)} scenes (style: {self.visual_style})...")
+                try:
+                    image_paths = generate_scene_images(
+                        scenes=scenes_for_images,
+                        output_dir=str(IMAGE_OUTPUT_DIR),
+                        style=self.visual_style,
+                    )
+                    # If we're in ai_plus_stock mode, merge image paths with stock video slots
+                    if self.visual_mode == "ai_plus_stock" and self.artifacts.get("stock_videos"):
+                        full_image_paths = [None] * len(scenes)
+                        for idx, scene_idx in enumerate(missing_indices):
+                            if idx < len(image_paths):
+                                full_image_paths[scene_idx] = image_paths[idx]
+                        self.artifacts["image_files"] = full_image_paths
+                    else:
                         self.artifacts["image_files"] = image_paths
-                    except Exception:
-                        self.artifacts["image_files"] = self._create_all_placeholders(scenes)
+                    success = sum(1 for p in image_paths if p is not None)
+                    print(f"  [visuals] Generated {success}/{len(scenes_for_images)} AI images")
+                except Exception as e:
+                    print(f"  [visuals] WARNING: AI image generation failed: {e}")
+                    self.artifacts["image_files"] = self._create_all_placeholders(scenes)
 
         # Ensure we have at least some visual assets
-        if not self.artifacts["image_files"] and not self.artifacts["stock_videos"]:
+        stock_count = sum(1 for p in self.artifacts.get("stock_videos", []) if p is not None)
+        image_count = sum(1 for p in self.artifacts.get("image_files", []) if p is not None)
+
+        if stock_count == 0 and image_count == 0:
             print("  [visuals] No visual assets generated, creating placeholders...")
             self.artifacts["image_files"] = self._create_all_placeholders(scenes)
 
     def _step_compose(self, **kwargs):
-        """Compose the final video with Ken Burns effects, transitions, and text overlays."""
+        """Compose the final video.
+
+        Uses stock videos as the primary visual source.
+        Falls back to AI images with Ken Burns effects if stock videos aren't available.
+        """
         scenes = self.plan.get("scenes", [])
         title = self.plan.get("title", "Untitled")
         audio_path = self.artifacts.get("combined_audio")
 
-        # Determine visual source: prefer stock videos if available, else AI images
+        stock_videos = self.artifacts.get("stock_videos", [])
         image_paths = self.artifacts.get("image_files", [])
 
-        if not image_paths:
-            raise RuntimeError("No visual assets available for video composition")
-
-        # Filter out None paths
+        # Count valid assets
+        valid_stock = [p for p in stock_videos if p and os.path.exists(p)]
         valid_images = [p for p in image_paths if p and os.path.exists(p)]
-        if not valid_images:
-            raise RuntimeError("No valid image files found for video composition")
 
         output_path = str(VIDEO_OUTPUT_DIR / "final_video.mp4")
 
-        print(f"  [compose] Creating dynamic video with {len(valid_images)} images...")
-        try:
-            result = create_dynamic_video(
-                image_paths=image_paths,
-                audio_path=audio_path,
-                scenes=scenes,
-                output_path=output_path,
-                resolution=self.video_resolution,
-                title=title,
-                visual_style=self.visual_style,
-            )
-            self.artifacts["final_video"] = result
-            print(f"  [compose] Final video: {result}")
-        except Exception as e:
-            print(f"  [compose] Dynamic video failed: {e}")
-            # Try simpler composition
-            raise
+        if valid_stock:
+            # PRIMARY: Use stock video composition
+            print(f"  [compose] Creating stock video composition with {len(valid_stock)} clips...")
+            try:
+                result = create_stock_video(
+                    video_paths=stock_videos,
+                    audio_path=audio_path,
+                    scenes=scenes,
+                    output_path=output_path,
+                    resolution=self.video_resolution,
+                    title=title,
+                    visual_style=self.visual_style,
+                )
+                self.artifacts["final_video"] = result
+                print(f"  [compose] Final video: {result}")
+                return
+            except Exception as e:
+                print(f"  [compose] Stock video composition failed: {e}, trying image fallback...")
+
+        if valid_images:
+            # FALLBACK: Use AI image composition with Ken Burns
+            print(f"  [compose] Creating image-based video with {len(valid_images)} images...")
+            try:
+                result = create_dynamic_video(
+                    image_paths=image_paths,
+                    audio_path=audio_path,
+                    scenes=scenes,
+                    output_path=output_path,
+                    resolution=self.video_resolution,
+                    title=title,
+                    visual_style=self.visual_style,
+                )
+                self.artifacts["final_video"] = result
+                print(f"  [compose] Final video: {result}")
+                return
+            except Exception as e:
+                print(f"  [compose] Image-based video failed: {e}")
+
+        raise RuntimeError("No visual assets available for video composition")
 
     def _fallback_compose(self, **kwargs):
         """Simple fallback video composition if the dynamic method fails."""
@@ -313,7 +363,6 @@ class PlanExecutor:
             valid_images = [p for p in image_paths if p and os.path.exists(p)]
             if valid_images:
                 try:
-                    # Create a directory with just the valid images
                     slides_dir = VIDEO_OUTPUT_DIR / "fallback_frames"
                     slides_dir.mkdir(exist_ok=True)
                     for i, img in enumerate(valid_images):
@@ -358,21 +407,18 @@ class PlanExecutor:
         publishing = self.plan.get("publishing", {})
         published_to = []
 
-        # YouTube
         if "youtube" in publishing and os.environ.get("YOUTUBE_ENABLED"):
             published_to.append({
                 "platform": "youtube",
                 "error": "Browser automation not available in this deployment"
             })
 
-        # TikTok
         if "tiktok" in publishing and os.environ.get("TIKTOK_ENABLED"):
             published_to.append({
                 "platform": "tiktok",
                 "error": "Browser automation not available in this deployment"
             })
 
-        # X
         if "x" in publishing and os.environ.get("X_ENABLED"):
             published_to.append({
                 "platform": "x",
@@ -382,14 +428,7 @@ class PlanExecutor:
         self.artifacts["published_to"] = published_to
 
     def _create_all_placeholders(self, scenes):
-        """Create gradient placeholder images for all scenes.
-
-        Args:
-            scenes: List of scene dicts.
-
-        Returns:
-            List of placeholder image paths.
-        """
+        """Create gradient placeholder images for all scenes."""
         placeholders = []
         for i, scene in enumerate(scenes):
             text = scene.get("visual_instructions", scene.get("narration", f"Scene {i+1}"))[:80]
@@ -447,21 +486,8 @@ class PlanExecutor:
 
 def execute_plan(plan=None, plan_path=None, tts_voice="mimo_default", publish=True,
                  video_resolution="720p", visual_style="cinematic",
-                 visual_mode="ai_images"):
-    """Execute a content plan end-to-end.
-
-    Args:
-        plan: Content plan dict (from create_plan).
-        plan_path: Path to a saved plan JSON file.
-        tts_voice: TTS voice to use.
-        publish: Whether to publish after composing.
-        video_resolution: Output video resolution.
-        visual_style: Visual style for AI image generation.
-        visual_mode: Visual source mode ("ai_images", "stock_videos", "ai_plus_stock").
-
-    Returns:
-        Dict with execution results.
-    """
+                 visual_mode="stock_videos"):
+    """Execute a content plan end-to-end."""
     executor = PlanExecutor(
         plan=plan, plan_path=plan_path,
         tts_voice=tts_voice, video_resolution=video_resolution,
