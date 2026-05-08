@@ -49,7 +49,7 @@ class PlanExecutor:
 
     def __init__(self, plan=None, plan_path=None, tts_voice="mimo_default",
                  video_resolution="720p", visual_style="cinematic",
-                 visual_mode="stock_videos"):
+                 visual_mode="ai_plus_stock"):
         """Initialize the executor.
 
         Args:
@@ -486,7 +486,7 @@ class PlanExecutor:
 
 def execute_plan(plan=None, plan_path=None, tts_voice="mimo_default", publish=True,
                  video_resolution="720p", visual_style="cinematic",
-                 visual_mode="stock_videos"):
+                 visual_mode="ai_plus_stock"):
     """Execute a content plan end-to-end."""
     executor = PlanExecutor(
         plan=plan, plan_path=plan_path,

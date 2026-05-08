@@ -506,7 +506,7 @@ with gr.Blocks(
                         )
                         pipe_visual_mode = gr.Dropdown(
                             ["stock_videos", "ai_plus_stock", "ai_images"],
-                            value="stock_videos", label="🎥 Visual Source"
+                            value="ai_plus_stock", label="🎥 Visual Source"
                         )
                     pipe_publish = gr.Checkbox(value=False, label="Enable Publishing (requires browser session)")
 
