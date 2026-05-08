@@ -1,9 +1,11 @@
 FROM python:3.11-slim
 
-# Install system dependencies (curl for health check + ffmpeg for video)
+# Install system dependencies (curl for health check + ffmpeg for video + fonts for text rendering)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
+    fonts-dejavu \
+    fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -17,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create output directories
-RUN mkdir -p /tmp/content-studio/videos /tmp/content-studio/plans /tmp/content-studio/audio
+RUN mkdir -p /tmp/content-studio/videos /tmp/content-studio/plans /tmp/content-studio/audio /tmp/content-studio/images
 
 # Expose Gradio port
 EXPOSE 7860

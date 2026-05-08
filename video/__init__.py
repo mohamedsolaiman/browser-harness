@@ -1,7 +1,9 @@
-"""Video recording and editing for browser-harness.
+"""Video recording and editing for Content Automation Studio.
 
-Provides browser session recording (CDP screencast frames → MP4)
-and video editing/compositing (add TTS audio, titles, overlays).
+Provides dynamic video composition with Ken Burns effects, crossfade transitions,
+text overlays, and subtitle generation — all using ffmpeg.
 """
-from .recorder import SessionRecorder, start_recording, stop_recording, capture_frame
-from .editor import VideoEditor, compose_video
+from .editor import (
+    compose_video, create_dynamic_video, create_slideshow,
+    generate_srt, create_gradient_placeholder,
+)

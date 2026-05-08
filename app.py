@@ -4,20 +4,25 @@
 Deployed on Hugging Face Spaces. Provides a web interface to:
 1. Create content plans (AI scripts your video)
 2. Generate TTS voiceover
-3. Compose videos with browser screenshots/slides
-4. Publish to YouTube, TikTok, X (when enabled)
+3. Generate AI images for each scene (Pollinations.ai)
+4. Compose dynamic videos with Ken Burns effects and transitions
+5. Publish to YouTube, TikTok, X (when enabled)
 
 All API keys stored as HF Space secrets — never exposed.
 
 API: Xiaomi MiMo (OpenAI-compatible)
 - Chat: https://api.xiaomimimo.com/v1/chat/completions
 - TTS:  https://api.xiaomimimo.com/v1/chat/completions (model: mimo-v2-tts)
+
+Image Generation: Pollinations.ai (free, no API key)
+Stock Video: Pexels API (optional, requires PEXELS_API_KEY)
 """
 
 import os
 import sys
 import json
 import time
+import subprocess
 import tempfile
 import traceback
 from pathlib import Path
@@ -38,11 +43,13 @@ def _ensure_modules():
     from planner.planner import ContentPlanner
     from planner.executor import PlanExecutor
     from tts.mimo_tts import MimoTTS, generate_speech
-    from video.editor import VideoEditor, compose_video, create_slideshow, generate_srt
+    from video.editor import compose_video, create_dynamic_video, generate_srt
+    from visuals.image_gen import generate_image, generate_scene_images, enhance_prompt
+    from visuals.stock_video import search_stock_videos, download_stock_video, get_videos_for_topic
     _modules_loaded = True
 
 
-OUTPUT_DIR = Path(os.environ.get("BH_OUTPUT_DIR", "/tmp/content-studio"))
+OUTPUT_DIR = Path(os.environ.get("CS_OUTPUT_DIR", "/tmp/content-studio"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PLANS_DIR = OUTPUT_DIR / "plans"
 PLANS_DIR.mkdir(exist_ok=True)
@@ -50,6 +57,8 @@ VIDEOS_DIR = OUTPUT_DIR / "videos"
 VIDEOS_DIR.mkdir(exist_ok=True)
 AUDIO_DIR = OUTPUT_DIR / "audio"
 AUDIO_DIR.mkdir(exist_ok=True)
+IMAGES_DIR = OUTPUT_DIR / "images"
+IMAGES_DIR.mkdir(exist_ok=True)
 
 
 def create_content_plan(topic, platforms, duration, style, language, instructions):
@@ -87,8 +96,7 @@ def create_content_plan(topic, platforms, duration, style, language, instruction
         for i, scene in enumerate(plan.get("scenes", []), 1):
             output += f"""**Scene {i}** ({scene.get('duration_seconds', '?')}s)
 - 🎤 Narration: {scene.get('narration', 'N/A')[:200]}
-- 🖥️ Visual: {scene.get('visual_type', 'N/A')} — {scene.get('visual_instructions', 'N/A')[:150]}
-- 🔗 URL: {scene.get('url', 'N/A')}
+- 🖼️ Visual: {scene.get('visual_type', 'N/A')} — {scene.get('visual_instructions', 'N/A')[:150]}
 
 """
 
@@ -109,7 +117,11 @@ def create_content_plan(topic, platforms, duration, style, language, instruction
         return output, plan_path
 
     except Exception as e:
-        return f"❌ Planning failed: {e}\n\n```\n{traceback.format_exc()[-1000:]}\n```", None
+        error_msg = f"❌ Planning failed: {e}"
+        tb = traceback.format_exc()
+        if len(tb) > 500:
+            tb = tb[-500:]
+        return f"{error_msg}\n\n<details><summary>Error Details</summary>\n\n```\n{tb}\n```\n</details>", None
 
 
 def generate_tts_audio(text, voice, speed):
@@ -134,7 +146,8 @@ def generate_tts_audio(text, voice, speed):
 
 
 def execute_full_pipeline(topic, platforms, duration, style, language, instructions,
-                          tts_voice, resolution, enable_publish, enable_headless):
+                          tts_voice, resolution, visual_style, visual_mode,
+                          enable_publish):
     _ensure_modules()
     from planner.planner import ContentPlanner
     from planner.executor import PlanExecutor
@@ -147,7 +160,12 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
 
     try:
         # Step 1: Plan
-        yield "🧠 **Step 1/4: Creating content plan...**\n\nConnecting to MiMo AI to generate script and visual directions...\n\n⏳ This may take 30-60 seconds depending on the topic.", None, None, None
+        yield (
+            "🧠 **Step 1/4: Creating content plan...**\n\n"
+            "Connecting to MiMo AI to generate script and visual directions...\n\n"
+            "⏳ This may take 30-60 seconds depending on the topic.",
+            None, None, None
+        )
 
         planner = ContentPlanner()
         plan = planner.plan(
@@ -162,33 +180,104 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
         scenes = plan.get("scenes", [])
         plan_summary = f"**{plan.get('title', 'Untitled')}** — {len(scenes)} scenes, ~{plan.get('duration_estimate_seconds', '?')}s"
 
-        # Step 2: TTS
-        yield f"🎙️ **Step 2/4: Generating voiceover...**\n\nPlan: {plan_summary}\n\nGenerating TTS audio for {len(scenes)} scenes using MiMo TTS...\n\n⏳ Each scene takes ~10 seconds.", None, None, None
+        # Save plan
+        plan_path = planner.save_plan(plan, output_path=str(PLANS_DIR / f"plan_{int(time.time())}.json"))
+        plan["plan_path"] = plan_path
 
-        executor = PlanExecutor(plan=plan, tts_voice=tts_voice, video_resolution=resolution)
+        # Step 2: TTS
+        yield (
+            f"🎙️ **Step 2/4: Generating voiceover...**\n\n"
+            f"Plan: {plan_summary}\n\n"
+            f"Generating TTS audio for {len(scenes)} scenes using MiMo TTS...\n\n"
+            f"⏳ Each scene takes ~10 seconds.",
+            None, None, None
+        )
+
+        executor = PlanExecutor(
+            plan=plan,
+            tts_voice=tts_voice,
+            video_resolution=resolution,
+            visual_style=visual_style,
+            visual_mode=visual_mode,
+        )
 
         # Run TTS step
         try:
             executor._step_tts()
+            audio_ok = len(executor.artifacts.get("audio_files", []))
+            yield (
+                f"✅ TTS complete: {audio_ok}/{len(scenes)} audio files generated\n\n"
+                f"Moving to visual generation...",
+                None, None, None
+            )
         except Exception as e:
-            yield f"⚠️ TTS step had issues: {e}\n\nContinuing with visual capture...", None, None, None
+            yield (
+                f"⚠️ TTS step had issues: {e}\n\n"
+                f"Continuing with visual generation...",
+                None, None, None
+            )
 
-        # Step 3: Record/Capture
-        yield f"🖥️ **Step 3/4: Creating visual slides...**\n\nPlan: {plan_summary}\n\nGenerating placeholder slides for each scene...", None, None, None
+        # Step 3: Generate AI images
+        visual_mode_label = {
+            "ai_images": "AI-Generated Images (Pollinations.ai)",
+            "stock_videos": "Stock Videos (Pexels)",
+            "ai_plus_stock": "AI Images + Stock Videos",
+        }.get(visual_mode, visual_mode)
+
+        yield (
+            f"🎨 **Step 3/4: Generating visuals...**\n\n"
+            f"Plan: {plan_summary}\n\n"
+            f"Mode: {visual_mode_label}\n"
+            f"Style: {visual_style}\n\n"
+            f"Generating images for {len(scenes)} scenes using Pollinations.ai (free)...\n\n"
+            f"⏳ Each image takes ~15-30 seconds.",
+            None, None, None
+        )
 
         try:
-            executor._step_record(headless=True)
+            executor._step_visuals()
+            img_ok = sum(1 for p in executor.artifacts.get("image_files", []) if p is not None)
+            vid_ok = sum(1 for p in executor.artifacts.get("stock_videos", []) if p is not None)
+            visual_info = f"Images: {img_ok}/{len(scenes)}"
+            if vid_ok > 0:
+                visual_info += f" | Stock videos: {vid_ok}"
+            yield (
+                f"✅ Visuals complete: {visual_info}\n\n"
+                f"Moving to video composition...",
+                None, None, None
+            )
         except Exception as e:
-            yield f"⚠️ Visual capture had issues: {e}\n\nContinuing with composition...", None, None, None
+            yield (
+                f"⚠️ Visual generation had issues: {e}\n\n"
+                f"Continuing with available visuals...",
+                None, None, None
+            )
 
         # Step 4: Compose
-        yield f"🎬 **Step 4/4: Composing final video...**\n\nPlan: {plan_summary}\n\nAssembling video with audio, titles, and overlays using ffmpeg...", None, None, None
+        yield (
+            f"🎬 **Step 4/4: Composing final video...**\n\n"
+            f"Plan: {plan_summary}\n\n"
+            f"Applying Ken Burns effects, crossfade transitions, and text overlays using ffmpeg...\n\n"
+            f"⏳ This takes 1-3 minutes depending on video length.",
+            None, None, None
+        )
 
         try:
             executor._step_compose()
         except Exception as e:
-            yield f"❌ Video composition failed: {e}\n\n```\n{traceback.format_exc()[-800:]}\n```", None, None, None
-            return
+            yield (
+                f"⚠️ Dynamic composition failed: {e}\n\nTrying simpler composition...",
+                None, None, None
+            )
+            try:
+                executor._fallback_compose()
+            except Exception as e2:
+                yield (
+                    f"❌ Video composition failed completely: {e2}\n\n"
+                    f"```\n{traceback.format_exc()[-800:]}\n```",
+                    None, None, None
+                )
+                return
 
         # Publishing
         published_info = ""
@@ -201,13 +290,13 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
                     for p in published:
                         platform = p.get("platform", "unknown")
                         if "error" in p:
-                            published_info += f"\n⚠️ {platform}: Failed — {p['error']}"
+                            published_info += f"\n⚠️ {platform}: {p['error']}"
                         else:
                             published_info += f"\n✅ {platform}: Published!"
                 else:
-                    published_info = "\n⚠️ No platforms were enabled for publishing (requires browser session)."
+                    published_info = "\n⚪ No platforms were enabled for publishing."
             except Exception as e:
-                published_info = f"\n⚠️ Publishing requires a logged-in browser session: {e}"
+                published_info = f"\n⚠️ Publishing failed: {e}"
 
         # Prepare results
         final_video = executor.artifacts.get("final_video")
@@ -234,11 +323,10 @@ def execute_full_pipeline(topic, platforms, duration, style, language, instructi
 
     except Exception as e:
         error_msg = f"❌ Pipeline failed: {e}"
-        # Don't include huge tracebacks that could crash Gradio
         tb = traceback.format_exc()
         if len(tb) > 500:
             tb = tb[-500:]
-        yield f"{error_msg}\n\n```\n{tb}\n```", None, None, None
+        yield f"{error_msg}\n\n<details><summary>Error Details</summary>\n\n```\n{tb}\n```\n</details>", None, None, None
 
 
 def load_and_show_plan(plan_path):
@@ -247,7 +335,7 @@ def load_and_show_plan(plan_path):
     try:
         with open(plan_path) as f:
             plan = json.load(f)
-        return f"```\n{json.dumps(plan, indent=2, ensure_ascii=False)[:3000]}\n```"
+        return f"```json\n{json.dumps(plan, indent=2, ensure_ascii=False)[:3000]}\n```"
     except Exception as e:
         return f"❌ Failed to load plan: {e}"
 
@@ -274,6 +362,7 @@ def check_status():
     keys = {
         "MIMO_API_KEY": bool(os.environ.get("MIMO_API_KEY")),
         "MIMO_BASE_URL": os.environ.get("MIMO_BASE_URL", "not set (using default)"),
+        "PEXELS_API_KEY": bool(os.environ.get("PEXELS_API_KEY")),
         "YOUTUBE_ENABLED": bool(os.environ.get("YOUTUBE_ENABLED")),
         "TIKTOK_ENABLED": bool(os.environ.get("TIKTOK_ENABLED")),
         "X_ENABLED": bool(os.environ.get("X_ENABLED")),
@@ -281,6 +370,7 @@ def check_status():
     output = "### 🔍 System Status\n\n"
     output += f"- **Mimo API Key**: {'✅ Set' if keys['MIMO_API_KEY'] else '❌ Missing — set MIMO_API_KEY in Space Secrets'}\n"
     output += f"- **Mimo Base URL**: `{keys['MIMO_BASE_URL']}`\n"
+    output += f"- **Pexels API Key**: {'✅ Set — stock videos available' if keys['PEXELS_API_KEY'] else '⚪ Not set — AI images only (free)'}\n"
     output += f"- **YouTube Publishing**: {'✅ Enabled' if keys['YOUTUBE_ENABLED'] else '⚪ Disabled'}\n"
     output += f"- **TikTok Publishing**: {'✅ Enabled' if keys['TIKTOK_ENABLED'] else '⚪ Disabled'}\n"
     output += f"- **X/Twitter Publishing**: {'✅ Enabled' if keys['X_ENABLED'] else '⚪ Disabled'}\n"
@@ -288,39 +378,48 @@ def check_status():
 
     # Quick connectivity test
     try:
-        import urllib.request
-        import urllib.error
+        import requests
         base_url = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
         api_key = os.environ.get("MIMO_API_KEY", "")
         if api_key:
             test_url = f"{base_url.rstrip('/')}/models"
-            req = urllib.request.Request(
+            resp = requests.get(
                 test_url,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-                models = [m.get("id", "?") for m in data.get("data", [])[:5]]
-                output += f"\n\n**API Connection**: ✅ Working! Available models: {', '.join(models)}"
-        else:
-            output += "\n\n**API Connection**: ⚠️ No API key set, skipping connectivity test."
-    except Exception as e:
-        # Try requests library as fallback
-        try:
-            import requests as req_lib
-            resp = req_lib.get(
-                f"{base_url.rstrip('/')}/models",
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=10,
             )
             if resp.status_code == 200:
                 data = resp.json()
                 models = [m.get("id", "?") for m in data.get("data", [])[:5]]
-                output += f"\n\n**API Connection**: ✅ Working (via requests)! Available models: {', '.join(models)}"
+                output += f"\n\n**API Connection**: ✅ Working! Available models: {', '.join(models)}"
             else:
                 output += f"\n\n**API Connection**: ❌ Failed — HTTP {resp.status_code}"
-        except Exception as e2:
-            output += f"\n\n**API Connection**: ❌ Failed — {str(e)[:150]}"
+        else:
+            output += "\n\n**API Connection**: ⚠️ No API key set, skipping test."
+    except Exception as e:
+        output += f"\n\n**API Connection**: ❌ Failed — {str(e)[:150]}"
+
+    # Check ffmpeg
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            version = result.stdout.split("\n")[0]
+            output += f"\n\n**FFmpeg**: ✅ {version}"
+        else:
+            output += "\n\n**FFmpeg**: ❌ Not working"
+    except Exception:
+        output += "\n\n**FFmpeg**: ❌ Not found"
+
+    # Check Pollinations.ai
+    try:
+        import requests
+        resp = requests.head(
+            "https://image.pollinations.ai/prompt/test?width=64&height=64&nologo=true",
+            timeout=10,
+        )
+        output += f"\n\n**Pollinations.ai**: ✅ Reachable (free AI image generation)"
+    except Exception:
+        output += "\n\n**Pollinations.ai**: ⚠️ Could not verify connectivity"
 
     return output
 
@@ -333,29 +432,34 @@ CSS = """
 .gradio-container { max-width: 1100px !important; }
 .plan-output { min-height: 300px; }
 footer { display: none !important; }
+.video-preview { max-width: 100%; }
 """
 
 with gr.Blocks(
     title="Content Automation Studio",
     css=CSS,
-    theme=gr.themes.Soft(primary_hue="indigo", secondary_hue="slate"),
+    theme=gr.themes.Soft(primary_hue="emerald", secondary_hue="slate"),
 ) as app:
 
     gr.Markdown("""
     # 🎬 Content Automation Studio
-    **AI-powered video creation and social media publishing.** Plan, narrate, compose, and publish — all from one interface.
+    **AI-powered video creation with cinematic visuals, voiceover, and dynamic composition.**
 
-    > Powered by **Xiaomi MiMo API** (OpenAI-compatible). API keys stored as Space secrets.
+    > 🖼️ **AI Images** by [Pollinations.ai](https://pollinations.ai) (free, no API key) •
+    > 🎙️ **Voiceover** by Xiaomi MiMo TTS •
+    > 🎥 **Stock Video** by Pexels (optional)
+
+    Create stunning videos in 4 steps: **Plan → TTS → AI Visuals → Compose**
     """)
 
     with gr.Tabs():
         # ── Tab 1: Full Pipeline ──
         with gr.Tab("🚀 Full Pipeline"):
-            gr.Markdown("### End-to-end: Plan → TTS → Compose → Publish")
+            gr.Markdown("### End-to-end: Plan → TTS → AI Visuals → Dynamic Video")
             with gr.Row():
                 with gr.Column(scale=2):
                     pipe_topic = gr.Textbox(
-                        label="Video Topic",
+                        label="📹 Video Topic",
                         placeholder="e.g. Python decorators explained for beginners",
                         lines=2,
                     )
@@ -368,7 +472,7 @@ with gr.Blocks(
                         pipe_duration = gr.Slider(1, 10, value=3, step=1, label="Duration (minutes)")
                         pipe_style = gr.Dropdown(
                             ["tutorial", "explainer", "review", "demo", "news"],
-                            value="tutorial", label="Style"
+                            value="tutorial", label="Content Style"
                         )
                         pipe_language = gr.Dropdown(
                             ["en", "es", "fr", "de", "ar", "zh", "ja", "ko", "pt", "hi"],
@@ -389,15 +493,23 @@ with gr.Blocks(
                             value="720p", label="Resolution"
                         )
                     with gr.Row():
-                        pipe_publish = gr.Checkbox(value=False, label="Enable Publishing (requires browser session)")
-                        pipe_headless = gr.Checkbox(value=True, label="Slideshow Mode (no browser needed)")
+                        pipe_visual_style = gr.Dropdown(
+                            ["cinematic", "corporate", "tech_code", "nature", "abstract"],
+                            value="cinematic", label="🖼️ Visual Style"
+                        )
+                        pipe_visual_mode = gr.Dropdown(
+                            ["ai_images", "stock_videos", "ai_plus_stock"],
+                            value="ai_images", label="🎥 Visual Source"
+                        )
+                    pipe_publish = gr.Checkbox(value=False, label="Enable Publishing (requires browser session)")
 
                     pipe_btn = gr.Button("🚀 Run Full Pipeline", variant="primary", size="lg")
 
                 with gr.Column(scale=3):
                     pipe_output = gr.Markdown(label="Progress & Results", elem_classes=["plan-output"])
+                    pipe_video_player = gr.Video(label="📹 Final Video Preview", elem_classes=["video-preview"])
                     with gr.Row():
-                        pipe_video = gr.File(label="📹 Final Video")
+                        pipe_video = gr.File(label="📹 Download Video")
                         pipe_audio = gr.File(label="🎙️ Audio")
                         pipe_srt = gr.File(label="📝 Subtitles")
 
@@ -406,9 +518,9 @@ with gr.Blocks(
                 inputs=[
                     pipe_topic, pipe_platforms, pipe_duration, pipe_style,
                     pipe_language, pipe_instructions, pipe_voice, pipe_resolution,
-                    pipe_publish, pipe_headless,
+                    pipe_visual_style, pipe_visual_mode, pipe_publish,
                 ],
-                outputs=[pipe_output, pipe_video, pipe_audio, pipe_srt],
+                outputs=[pipe_output, pipe_video_player, pipe_audio, pipe_srt],
             )
 
         # ── Tab 2: Plan Only ──
@@ -475,7 +587,48 @@ with gr.Blocks(
                 outputs=[tts_output, tts_file],
             )
 
-        # ── Tab 4: Saved Plans ──
+        # ── Tab 4: AI Image Preview ──
+        with gr.Tab("🖼️ AI Image Preview"):
+            gr.Markdown("### Test AI image generation with Pollinations.ai (free, no API key needed)")
+            with gr.Row():
+                with gr.Column():
+                    img_prompt = gr.Textbox(
+                        label="Image Prompt",
+                        placeholder="e.g. A dramatic sunset over mountain peaks, cinematic lighting",
+                        lines=3,
+                    )
+                    img_style = gr.Dropdown(
+                        ["cinematic", "corporate", "tech_code", "nature", "abstract"],
+                        value="cinematic", label="Visual Style"
+                    )
+                    img_btn = gr.Button("🖼️ Generate Preview Image", variant="primary")
+
+                with gr.Column():
+                    img_output = gr.Markdown()
+                    img_preview = gr.Image(label="Generated Image", type="filepath")
+
+            def preview_image(prompt, style):
+                _ensure_modules()
+                from visuals.image_gen import generate_image
+                if not prompt.strip():
+                    return "❌ Please enter a prompt.", None
+                try:
+                    path = generate_image(
+                        prompt=prompt.strip(),
+                        style=style,
+                        output_path=str(IMAGES_DIR / f"preview_{int(time.time())}.jpg"),
+                    )
+                    return f"✅ Image generated!\n\n📁 File: `{path}`", path
+                except Exception as e:
+                    return f"❌ Image generation failed: {e}", None
+
+            img_btn.click(
+                fn=preview_image,
+                inputs=[img_prompt, img_style],
+                outputs=[img_output, img_preview],
+            )
+
+        # ── Tab 5: Saved Plans ──
         with gr.Tab("📂 Saved Plans"):
             gr.Markdown("### Browse and manage saved content plans")
             refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
@@ -487,7 +640,7 @@ with gr.Blocks(
             refresh_btn.click(fn=list_saved_plans, outputs=[plans_list])
             view_btn.click(fn=load_and_show_plan, inputs=[plan_path_input], outputs=[plan_view])
 
-        # ── Tab 5: Settings ──
+        # ── Tab 6: Settings ──
         with gr.Tab("⚙️ Settings"):
             gr.Markdown("""
             ### Configuration
@@ -500,9 +653,18 @@ with gr.Blocks(
             | `MIMO_BASE_URL` | No | API base URL (default: `https://api.xiaomimimo.com/v1`) |
             | `MIMO_TTS_MODEL` | No | TTS model (default: `mimo-v2-tts`) |
             | `PLANNER_MODEL` | No | LLM model for planning (default: `mimo-v2-flash`) |
+            | `PEXELS_API_KEY` | No | Pexels API key for stock video (free at pexels.com/api) |
             | `YOUTUBE_ENABLED` | No | Set `1` to enable YouTube publishing |
             | `TIKTOK_ENABLED` | No | Set `1` to enable TikTok publishing |
             | `X_ENABLED` | No | Set `1` to enable X/Twitter publishing |
+
+            ### Visual Sources
+
+            | Mode | Description | API Key Required |
+            |------|-------------|------------------|
+            | **AI Images** | Generate cinematic images with Pollinations.ai | ❌ Free, no key |
+            | **Stock Videos** | Download stock footage from Pexels | ✅ PEXELS_API_KEY |
+            | **AI + Stock** | Both AI images and stock footage | Pexels optional |
             """)
 
             status_btn = gr.Button("🔍 Check Status & API Connection", variant="primary")

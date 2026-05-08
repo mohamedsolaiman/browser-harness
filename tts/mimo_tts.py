@@ -17,6 +17,7 @@ Available voices:
 
 Available formats: wav, pcm16 (for streaming)
 
+Only uses https://api.xiaomimimo.com/v1 — no broken fallback URLs.
 Reads MIMO_API_KEY from environment variables — never hard-coded.
 """
 
@@ -33,24 +34,32 @@ MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
 MIMO_BASE_URL = os.environ.get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
 MIMO_TTS_MODEL = os.environ.get("MIMO_TTS_MODEL", "mimo-v2-tts")
 
-# Fallback URLs to try if primary fails
-FALLBACK_BASE_URLS = [
-    "https://api.xiaomimimo.com/v1",
-    "https://api.mimo-v2.com/v1",
-]
-
 # Output directory
-TTS_OUTPUT_DIR = Path(os.environ.get("BH_VIDEO_DIR", Path.home() / "browser-harness-videos"))
+TTS_OUTPUT_DIR = Path(os.environ.get("CS_AUDIO_DIR", "/tmp/content-studio/audio"))
 TTS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _tts_api_request(base_url, api_key, payload, timeout=60):
     """Make a TTS API request using the best available HTTP library.
 
-    Tries: openai SDK → requests → urllib (in that order)
+    Tries: requests → urllib (in that order)
     Returns the parsed JSON response dict.
+
+    Args:
+        base_url: API base URL.
+        api_key: API key.
+        payload: Request payload dict.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        Parsed JSON response dict.
+
+    Raises:
+        RuntimeError: If all methods fail.
     """
-    # Method 1: Try requests library (best for TTS since openai SDK may not handle audio response)
+    last_error = None
+
+    # Method 1: Try requests library (most reliable in containers)
     try:
         import requests as req_lib
         url = f"{base_url.rstrip('/')}/chat/completions"
@@ -58,27 +67,32 @@ def _tts_api_request(base_url, api_key, payload, timeout=60):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
+        print(f"  [tts] Trying requests to {url}...")
         resp = req_lib.post(url, json=payload, headers=headers, timeout=timeout)
         if resp.status_code >= 400:
             raise RuntimeError(f"TTS API error (HTTP {resp.status_code}): {resp.text[:300]}")
+        print(f"  [tts] requests succeeded (HTTP {resp.status_code})")
         return resp.json()
     except ImportError:
-        pass
+        print("  [tts] requests library not available, trying urllib...")
     except Exception as e:
+        last_error = e
         print(f"  [tts] requests failed ({e}), trying urllib...")
 
     # Method 2: Fallback to urllib
-    import urllib.request
-    import urllib.error
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
     try:
+        import urllib.request
+        import urllib.error
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read())
+            data = json.loads(response.read())
+            print(f"  [tts] urllib succeeded")
+            return data
     except urllib.error.HTTPError as e:
         error_body = e.read().decode() if e.fp else "unknown"
         raise RuntimeError(
@@ -90,6 +104,13 @@ def _tts_api_request(base_url, api_key, payload, timeout=60):
             f"Cannot reach MiMo API at {url}: {e.reason}. "
             f"Check MIMO_BASE_URL. Current: {base_url}"
         ) from e
+    except Exception as e:
+        last_error = e
+
+    raise RuntimeError(
+        f"All TTS API request methods failed. Last error: {last_error}. "
+        f"Check MIMO_API_KEY and network connectivity."
+    )
 
 
 class MimoTTS:
@@ -136,7 +157,11 @@ class MimoTTS:
 
         Returns:
             Path to the saved audio file.
+
+        Raises:
+            RuntimeError: If TTS generation fails.
         """
+        # Handle long text by splitting
         if len(text) > 4096:
             return self._generate_long_text(text, voice, output_path, response_format, speed, style)
 
@@ -146,7 +171,6 @@ class MimoTTS:
             output_path = str(TTS_OUTPUT_DIR / f"tts_{timestamp}.{ext}")
 
         # Build the message content with optional style tag
-        # The text to speak goes in the ASSISTANT message
         assistant_content = text
         if style:
             assistant_content = f"<style>{style}</style>{text}"
@@ -167,41 +191,46 @@ class MimoTTS:
             },
         }
 
-        # Try each URL with fallback
-        urls_to_try = [self.base_url] + [u for u in FALLBACK_BASE_URLS if u.rstrip("/") != self.base_url]
-        last_error = None
+        try:
+            data = _tts_api_request(self.base_url, self.api_key, body, timeout=60)
+            # Extract audio from the response
+            audio_bytes = self._extract_audio(data)
 
-        for url in urls_to_try:
-            try:
-                data = _tts_api_request(url, self.api_key, body, timeout=60)
-                # Extract audio from the response
-                audio_bytes = self._extract_audio(data)
-                print(f"  [tts] TTS succeeded using {url}")
+            # Handle PCM16 format — needs conversion to WAV
+            if response_format == "pcm16":
+                output_path = self._pcm16_to_wav(audio_bytes, output_path)
+            else:
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, "wb") as f:
+                    f.write(audio_bytes)
 
-                # Handle PCM16 format — needs conversion to WAV
-                if response_format == "pcm16":
-                    output_path = self._pcm16_to_wav(audio_bytes, output_path)
-                else:
-                    with open(output_path, "wb") as f:
-                        f.write(audio_bytes)
+            print(f"  [tts] Audio saved: {output_path} ({len(audio_bytes):,} bytes)")
+            return output_path
 
-                return output_path
-            except Exception as e:
-                last_error = e
-                print(f"  [tts] Failed with {url}: {e}")
-                continue
-
-        raise RuntimeError(
-            f"All TTS API URLs failed. Last error: {last_error}. "
-            f"Check MIMO_API_KEY and MIMO_BASE_URL."
-        )
+        except Exception as e:
+            raise RuntimeError(
+                f"TTS generation failed: {e}. "
+                f"Check MIMO_API_KEY and MIMO_BASE_URL settings."
+            ) from e
 
     def _extract_audio(self, data):
-        """Extract audio bytes from the API response."""
+        """Extract audio bytes from the API response.
+
+        Args:
+            data: Parsed JSON response dict.
+
+        Returns:
+            Audio bytes.
+
+        Raises:
+            RuntimeError: If no audio data found in response.
+        """
         try:
             choices = data.get("choices", [])
             if not choices:
-                raise RuntimeError(f"No choices in TTS response. Full response: {json.dumps(data)[:500]}")
+                raise RuntimeError(
+                    f"No choices in TTS response. Full response: {json.dumps(data)[:500]}"
+                )
 
             message = choices[0].get("message", {})
             audio_data = message.get("audio", {}).get("data")
@@ -221,10 +250,21 @@ class MimoTTS:
             return audio_bytes
 
         except (KeyError, IndexError) as e:
-            raise RuntimeError(f"Unexpected TTS response format: {e}. Response: {json.dumps(data)[:500]}") from e
+            raise RuntimeError(
+                f"Unexpected TTS response format: {e}. "
+                f"Response: {json.dumps(data)[:500]}"
+            ) from e
 
     def _pcm16_to_wav(self, pcm_data, output_path):
-        """Convert raw PCM16 data to a WAV file using ffmpeg."""
+        """Convert raw PCM16 data to a WAV file using ffmpeg.
+
+        Args:
+            pcm_data: Raw PCM16 audio bytes.
+            output_path: Target output path.
+
+        Returns:
+            Path to the WAV file.
+        """
         raw_path = output_path.rsplit(".", 1)[0] + ".pcm"
         with open(raw_path, "wb") as f:
             f.write(pcm_data)
@@ -251,17 +291,36 @@ class MimoTTS:
         return output_path
 
     def _generate_long_text(self, text, voice, output_path, response_format, speed, style):
-        """Generate speech for text longer than 4096 characters by splitting into chunks."""
+        """Generate speech for text longer than 4096 characters by splitting into chunks.
+
+        Args:
+            text: Full text to convert.
+            voice: TTS voice.
+            output_path: Output file path.
+            response_format: Audio format.
+            speed: Speech speed.
+            style: Optional style.
+
+        Returns:
+            Path to the concatenated audio file.
+        """
         chunks = self._split_text(text, max_length=3800)
         chunk_paths = []
 
         for i, chunk in enumerate(chunks):
-            chunk_path = tempfile.mktemp(suffix=".wav")
-            path = self.generate(
-                chunk, voice=voice, output_path=chunk_path,
-                response_format=response_format, speed=speed, style=style,
-            )
-            chunk_paths.append(path)
+            try:
+                chunk_path = tempfile.mktemp(suffix=".wav")
+                path = self.generate(
+                    chunk, voice=voice, output_path=chunk_path,
+                    response_format=response_format, speed=speed, style=style,
+                )
+                chunk_paths.append(path)
+            except Exception as e:
+                print(f"  [tts] WARNING: Failed to generate chunk {i + 1}/{len(chunks)}: {e}")
+                continue
+
+        if not chunk_paths:
+            raise RuntimeError("All TTS chunks failed")
 
         if output_path is None:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -270,7 +329,15 @@ class MimoTTS:
         return self._concatenate_audio(chunk_paths, output_path)
 
     def _split_text(self, text, max_length=3800):
-        """Split text into chunks at sentence boundaries."""
+        """Split text into chunks at sentence boundaries.
+
+        Args:
+            text: Text to split.
+            max_length: Maximum chunk length.
+
+        Returns:
+            List of text chunks.
+        """
         sentences = text.replace(". ", ".\n").replace("? ", "?\n").replace("! ", "!\n").split("\n")
         chunks = []
         current = ""
@@ -289,7 +356,15 @@ class MimoTTS:
         return chunks
 
     def _concatenate_audio(self, paths, output_path):
-        """Concatenate multiple audio files using ffmpeg."""
+        """Concatenate multiple audio files using ffmpeg.
+
+        Args:
+            paths: List of audio file paths.
+            output_path: Output path.
+
+        Returns:
+            Path to the concatenated audio file.
+        """
         concat_file = tempfile.mktemp(suffix=".txt")
         with open(concat_file, "w") as f:
             for p in paths:
@@ -316,7 +391,11 @@ class MimoTTS:
         return output_path
 
     def list_voices(self):
-        """List available TTS voices."""
+        """List available TTS voices.
+
+        Returns:
+            List of voice dicts with id and name.
+        """
         return [
             {"id": "mimo_default", "name": "MiMo-Default"},
             {"id": "default_zh", "name": "MiMo-Chinese Female"},
@@ -327,11 +406,26 @@ class MimoTTS:
 # --- Module-level convenience ---
 
 def generate_speech(text, voice="mimo_default", output_path=None, speed=1.0, style=None):
-    """Generate speech from text using MiMo TTS."""
+    """Generate speech from text using MiMo TTS.
+
+    Args:
+        text: Text to convert to speech.
+        voice: Voice to use.
+        output_path: Output file path.
+        speed: Speech speed.
+        style: Optional style.
+
+    Returns:
+        Path to the saved audio file.
+    """
     client = MimoTTS()
     return client.generate(text, voice=voice, output_path=output_path, speed=speed, style=style)
 
 
 def list_voices():
-    """List available TTS voices."""
+    """List available TTS voices.
+
+    Returns:
+        Dict of voice names.
+    """
     return MimoTTS.VOICES

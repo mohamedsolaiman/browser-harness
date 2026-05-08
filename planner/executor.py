@@ -1,18 +1,13 @@
-"""Plan executor — orchestrates video creation, TTS, and publishing.
+"""Plan executor — orchestrates video creation with AI visuals, TTS, and dynamic composition.
 
 Takes a content plan (from planner.py) and executes it step by step:
 1. Generate TTS audio for each scene
-2. Record/capture browser visuals
-3. Compose the final video
-4. Publish to YouTube, TikTok, and X
+2. Generate AI images for each scene (using Pollinations.ai)
+2b. Optionally download stock videos (if PEXELS_API_KEY is set)
+3. Compose dynamic video with Ken Burns + transitions
+4. Publish to YouTube, TikTok, and X (when enabled)
 
 All credentials from environment variables — never hard-coded.
-
-Usage:
-    from planner import create_plan, execute_plan
-    plan = create_plan("Python decorators tutorial")
-    result = execute_plan(plan)
-    print(f"Published: {result['published_to']}")
 """
 
 import json
@@ -25,22 +20,30 @@ from pathlib import Path
 # Import sibling modules
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from tts.mimo_tts import MimoTTS, generate_speech
-from video.recorder import SessionRecorder, start_recording, stop_recording, capture_frame
-from video.editor import VideoEditor, compose_video, create_slideshow, generate_srt
 
-VIDEO_OUTPUT_DIR = Path(os.environ.get("BH_VIDEO_DIR", Path.home() / "browser-harness-videos"))
+from tts.mimo_tts import MimoTTS, generate_speech
+from video.editor import (
+    create_dynamic_video, generate_srt, create_gradient_placeholder, compose_video
+)
+from visuals.image_gen import generate_scene_images, generate_image, enhance_prompt
+from visuals.stock_video import get_videos_for_topic
+
+VIDEO_OUTPUT_DIR = Path(os.environ.get("CS_VIDEO_DIR", "/tmp/content-studio/videos"))
+AUDIO_OUTPUT_DIR = Path(os.environ.get("CS_AUDIO_DIR", "/tmp/content-studio/audio"))
+IMAGE_OUTPUT_DIR = Path(os.environ.get("CS_IMAGE_DIR", "/tmp/content-studio/images"))
 
 
 class PlanExecutor:
-    """Executes a content plan: generates TTS, records video, composes, and publishes.
+    """Executes a content plan: generates TTS, AI images, composes dynamic video, and publishes.
 
     The executor is designed to run step by step, with each step producing
-    artifacts that the next step consumes. This allows for resumability and
-    partial execution.
+    artifacts that the next step consumes. All steps have robust error handling
+    and fallbacks — the executor should never crash.
     """
 
-    def __init__(self, plan=None, plan_path=None, tts_voice="alloy", video_resolution="1080p"):
+    def __init__(self, plan=None, plan_path=None, tts_voice="mimo_default",
+                 video_resolution="720p", visual_style="cinematic",
+                 visual_mode="ai_images"):
         """Initialize the executor.
 
         Args:
@@ -48,6 +51,8 @@ class PlanExecutor:
             plan_path: Path to a saved plan JSON file (alternative to plan dict).
             tts_voice: Default TTS voice to use.
             video_resolution: Output video resolution.
+            visual_style: Visual style for image generation.
+            visual_mode: Visual source mode ("ai_images", "stock_videos", "ai_plus_stock").
         """
         if plan is not None:
             self.plan = plan
@@ -59,35 +64,39 @@ class PlanExecutor:
 
         self.tts_voice = tts_voice
         self.video_resolution = video_resolution
+        self.visual_style = visual_style
+        self.visual_mode = visual_mode
         self.artifacts = {
             "audio_files": [],
-            "frame_dirs": [],
-            "video_segments": [],
+            "image_files": [],
+            "stock_videos": [],
+            "combined_audio": None,
             "final_video": None,
+            "subtitle_file": None,
             "published_to": [],
         }
         self._tts_client = None
 
-    def execute(self, steps=None, publish=True, headless=False):
+    def execute(self, steps=None, publish=True, headless=True):
         """Execute the content plan.
 
         Args:
             steps: List of step names to execute. Default: all steps.
-                   Options: "tts", "record", "compose", "publish"
+                   Options: "tts", "visuals", "compose", "publish"
             publish: Whether to publish after composing.
-            headless: If True, skip browser recording (use slideshow mode).
+            headless: Always True now (no browser needed).
 
         Returns:
             Dict with execution results and artifact paths.
         """
         if steps is None:
-            steps = ["tts", "record", "compose"]
+            steps = ["tts", "visuals", "compose"]
             if publish:
                 steps.append("publish")
 
         step_handlers = {
             "tts": self._step_tts,
-            "record": self._step_record,
+            "visuals": self._step_visuals,
             "compose": self._step_compose,
             "publish": self._step_publish,
         }
@@ -96,7 +105,13 @@ class PlanExecutor:
             if step not in step_handlers:
                 raise ValueError(f"Unknown step: {step}. Options: {list(step_handlers.keys())}")
             print(f"[executor] Running step: {step}")
-            step_handlers[step](headless=headless)
+            try:
+                step_handlers[step]()
+            except Exception as e:
+                print(f"[executor] Step {step} failed: {e}")
+                if step == "compose":
+                    # Try fallback composition
+                    self._fallback_compose()
             print(f"[executor] Step {step} complete")
 
         self.plan["status"] = "executed"
@@ -113,7 +128,10 @@ class PlanExecutor:
         return self._tts_client
 
     def _step_tts(self, **kwargs):
-        """Generate TTS audio for all scenes."""
+        """Generate TTS audio for all scenes.
+
+        If TTS fails for a scene, estimates duration and continues.
+        """
         scenes = self.plan.get("scenes", [])
         if not scenes:
             raise RuntimeError("Plan has no scenes")
@@ -128,7 +146,7 @@ class PlanExecutor:
             if not narration:
                 continue
 
-            output_path = str(VIDEO_OUTPUT_DIR / f"scene_{i:03d}.wav")
+            output_path = str(AUDIO_OUTPUT_DIR / f"scene_{i:03d}.wav")
 
             print(f"  [tts] Generating audio for scene {i+1}/{len(scenes)}: {narration[:50]}...")
             try:
@@ -148,7 +166,7 @@ class PlanExecutor:
                 print(f"  [tts] WARNING: Failed to generate audio for scene {i+1}: {e}")
                 # Estimate duration from text length (~150 words/min)
                 words = len(narration.split())
-                estimated_duration = (words / 150) * 60
+                estimated_duration = max((words / 150) * 60, 5.0)
                 subtitle_segments.append({
                     "start": current_time,
                     "end": current_time + estimated_duration,
@@ -158,402 +176,235 @@ class PlanExecutor:
 
         # Concatenate all audio files into one
         if audio_files:
-            combined_audio = str(VIDEO_OUTPUT_DIR / "full_narration.wav")
-            self._concatenate_audio_files(audio_files, combined_audio)
-            self.artifacts["audio_files"] = audio_files
-            self.artifacts["combined_audio"] = combined_audio
+            combined_audio = str(AUDIO_OUTPUT_DIR / "full_narration.wav")
+            try:
+                self._concatenate_audio_files(audio_files, combined_audio)
+                self.artifacts["audio_files"] = audio_files
+                self.artifacts["combined_audio"] = combined_audio
+            except Exception as e:
+                print(f"  [tts] WARNING: Audio concatenation failed: {e}")
+                # Use first audio file if concatenation fails
+                if audio_files:
+                    self.artifacts["combined_audio"] = audio_files[0]
+                    self.artifacts["audio_files"] = audio_files
         else:
+            print("  [tts] WARNING: No audio files generated")
             self.artifacts["combined_audio"] = None
 
         # Generate SRT subtitles
         if subtitle_segments:
-            srt_path = generate_srt(subtitle_segments)
-            self.artifacts["subtitle_file"] = srt_path
+            try:
+                srt_path = generate_srt(subtitle_segments)
+                self.artifacts["subtitle_file"] = srt_path
+            except Exception as e:
+                print(f"  [tts] WARNING: SRT generation failed: {e}")
 
-    def _step_record(self, headless=False, **kwargs):
-        """Record browser visuals for each scene.
+    def _step_visuals(self, **kwargs):
+        """Generate AI images for each scene and optionally download stock videos.
 
-        Two modes:
-        - Browser recording: Navigate to URLs and record the browser session
-        - Slideshow: Capture screenshots at each URL and create a slideshow
+        Visual modes:
+        - "ai_images": Generate images using Pollinations.ai only
+        - "stock_videos": Download stock videos from Pexels only
+        - "ai_plus_stock": Both AI images and stock videos
         """
         scenes = self.plan.get("scenes", [])
         if not scenes:
             raise RuntimeError("Plan has no scenes")
 
-        frames_dir = VIDEO_OUTPUT_DIR / "frames"
-        frames_dir.mkdir(exist_ok=True)
+        # Step 2a: Generate AI images
+        if self.visual_mode in ("ai_images", "ai_plus_stock"):
+            print(f"  [visuals] Generating AI images for {len(scenes)} scenes (style: {self.visual_style})...")
+            try:
+                image_paths = generate_scene_images(
+                    scenes=scenes,
+                    output_dir=str(IMAGE_OUTPUT_DIR),
+                    style=self.visual_style,
+                )
+                self.artifacts["image_files"] = image_paths
+                success = sum(1 for p in image_paths if p is not None)
+                print(f"  [visuals] Generated {success}/{len(scenes)} AI images")
+            except Exception as e:
+                print(f"  [visuals] WARNING: AI image generation failed: {e}")
+                # Create gradient placeholders for all scenes
+                self.artifacts["image_files"] = self._create_all_placeholders(scenes)
 
-        try:
-            from browser_harness.helpers import (
-                goto_url, new_tab, capture_screenshot, wait_for_load,
-                wait, page_info, click_at_xy, scroll
-            )
-            browser_available = True
-        except ImportError:
-            browser_available = False
-            print("  [record] Browser harness not available, using slideshow mode")
-
-        if headless or not browser_available:
-            self._record_slideshow(scenes, frames_dir)
-        else:
-            self._record_browser(scenes, frames_dir)
-
-    def _record_browser(self, scenes, frames_dir):
-        """Record browser session by navigating through scenes."""
-        from browser_harness.helpers import (
-            goto_url, new_tab, capture_screenshot, wait_for_load,
-            wait, page_info, click_at_xy, scroll
-        )
-
-        # Start recording
-        recorder = start_recording(fps=8, quality=75)
-
-        for i, scene in enumerate(scenes):
-            visual_type = scene.get("visual_type", "browser_recording")
-            url = scene.get("url")
-            instructions = scene.get("visual_instructions", "")
-
-            print(f"  [record] Scene {i+1}: {visual_type} — {instructions[:60]}...")
-
-            if url:
+        # Step 2b: Optionally download stock videos
+        if self.visual_mode in ("stock_videos", "ai_plus_stock"):
+            pexels_key = os.environ.get("PEXELS_API_KEY", "")
+            if pexels_key:
+                topic = self.plan.get("topic", self.plan.get("title", ""))
+                print(f"  [visuals] Downloading stock videos for topic: {topic}")
                 try:
-                    goto_url(url)
-                    wait_for_load(timeout=15)
-                    wait(2)  # Let page settle
+                    stock_paths = get_videos_for_topic(
+                        topic=topic,
+                        scenes=scenes,
+                        api_key=pexels_key,
+                    )
+                    self.artifacts["stock_videos"] = stock_paths
                 except Exception as e:
-                    print(f"  [record] WARNING: Navigation failed for scene {i+1}: {e}")
-
-            # Execute visual instructions
-            if "scroll down" in instructions.lower():
-                for _ in range(3):
-                    scroll(960, 400, dy=-300)
-                    wait(0.5)
-            elif "scroll up" in instructions.lower():
-                for _ in range(3):
-                    scroll(960, 400, dy=300)
-                    wait(0.5)
-
-            # Pause for the scene duration
-            duration = scene.get("duration_seconds", 10)
-            wait(min(duration, 15))
-
-        # Stop recording and save
-        try:
-            video_path = stop_recording(output_path=str(VIDEO_OUTPUT_DIR / "raw_recording.mp4"))
-            self.artifacts["video_segments"].append(video_path)
-        except Exception as e:
-            print(f"  [record] WARNING: Recording stop failed: {e}")
-            # Fallback to screenshots
-            self._record_slideshow(scenes, frames_dir)
-
-    def _record_slideshow(self, scenes, frames_dir):
-        """Create slideshow frames from URLs."""
-        try:
-            from browser_harness.helpers import (
-                goto_url, new_tab, capture_screenshot, wait_for_load, wait
-            )
-            browser_available = True
-        except ImportError:
-            browser_available = False
-
-        for i, scene in enumerate(scenes):
-            url = scene.get("url")
-            frame_path = str(frames_dir / f"scene_{i:03d}.png")
-
-            print(f"  [slideshow] Capturing scene {i+1}/{len(scenes)}")
-
-            if browser_available and url:
-                try:
-                    if i == 0:
-                        new_tab(url)
-                    else:
-                        goto_url(url)
-                    wait_for_load(timeout=15)
-                    wait(2)
-                    capture_screenshot(frame_path)
-                except Exception as e:
-                    print(f"  [slideshow] WARNING: Capture failed for scene {i+1}: {e}")
-                    self._create_placeholder_frame(frame_path, scene.get("narration", "")[:50])
+                    print(f"  [visuals] WARNING: Stock video download failed: {e}")
             else:
-                self._create_placeholder_frame(frame_path, scene.get("narration", "")[:50])
+                print("  [visuals] No PEXELS_API_KEY set, skipping stock videos")
+                if self.visual_mode == "stock_videos":
+                    # Stock-only mode but no API key — fall back to AI images
+                    print("  [visuals] Falling back to AI image generation...")
+                    try:
+                        image_paths = generate_scene_images(
+                            scenes=scenes,
+                            output_dir=str(IMAGE_OUTPUT_DIR),
+                            style=self.visual_style,
+                        )
+                        self.artifacts["image_files"] = image_paths
+                    except Exception:
+                        self.artifacts["image_files"] = self._create_all_placeholders(scenes)
 
-        self.artifacts["frame_dirs"].append(str(frames_dir))
-
-    def _create_placeholder_frame(self, path, text):
-        """Create a placeholder frame with text when no browser is available."""
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", "color=c=#1a1a2e:s=1920x1080:d=1",
-            "-frames:v", "1",
-            "-vf", f"drawtext=text='{text.replace(chr(39), '')}':fontsize=48:"
-                   f"fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2",
-            path
-        ]
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        except Exception:
-            pass
+        # Ensure we have at least some visual assets
+        if not self.artifacts["image_files"] and not self.artifacts["stock_videos"]:
+            print("  [visuals] No visual assets generated, creating placeholders...")
+            self.artifacts["image_files"] = self._create_all_placeholders(scenes)
 
     def _step_compose(self, **kwargs):
-        """Compose the final video from all artifacts."""
-        # Determine video source
-        video_source = None
-        if self.artifacts["video_segments"]:
-            video_source = self.artifacts["video_segments"][0]
-        elif self.artifacts["frame_dirs"]:
-            # Create slideshow from frames
-            frames_dir = self.artifacts["frame_dirs"][0]
-            video_source = str(VIDEO_OUTPUT_DIR / "slideshow.mp4")
-            try:
-                create_slideshow(frames_dir, output_path=video_source, duration_per_frame=8)
-            except Exception as e:
-                print(f"  [compose] WARNING: Slideshow creation failed: {e}")
+        """Compose the final video with Ken Burns effects, transitions, and text overlays."""
+        scenes = self.plan.get("scenes", [])
+        title = self.plan.get("title", "Untitled")
+        audio_path = self.artifacts.get("combined_audio")
 
-        audio_source = self.artifacts.get("combined_audio")
+        # Determine visual source: prefer stock videos if available, else AI images
+        image_paths = self.artifacts.get("image_files", [])
+
+        if not image_paths:
+            raise RuntimeError("No visual assets available for video composition")
+
+        # Filter out None paths
+        valid_images = [p for p in image_paths if p and os.path.exists(p)]
+        if not valid_images:
+            raise RuntimeError("No valid image files found for video composition")
+
+        output_path = str(VIDEO_OUTPUT_DIR / "final_video.mp4")
+
+        print(f"  [compose] Creating dynamic video with {len(valid_images)} images...")
+        try:
+            result = create_dynamic_video(
+                image_paths=image_paths,
+                audio_path=audio_path,
+                scenes=scenes,
+                output_path=output_path,
+                resolution=self.video_resolution,
+                title=title,
+                visual_style=self.visual_style,
+            )
+            self.artifacts["final_video"] = result
+            print(f"  [compose] Final video: {result}")
+        except Exception as e:
+            print(f"  [compose] Dynamic video failed: {e}")
+            # Try simpler composition
+            raise
+
+    def _fallback_compose(self, **kwargs):
+        """Simple fallback video composition if the dynamic method fails."""
+        audio_path = self.artifacts.get("combined_audio")
+        image_paths = self.artifacts.get("image_files", [])
         title = self.plan.get("title", "Untitled")
 
-        if video_source:
-            output_path = str(VIDEO_OUTPUT_DIR / "final_video.mp4")
+        output_path = str(VIDEO_OUTPUT_DIR / "final_video_fallback.mp4")
+
+        # Try creating a simple slideshow from images
+        if image_paths:
+            valid_images = [p for p in image_paths if p and os.path.exists(p)]
+            if valid_images:
+                try:
+                    # Create a directory with just the valid images
+                    slides_dir = VIDEO_OUTPUT_DIR / "fallback_frames"
+                    slides_dir.mkdir(exist_ok=True)
+                    for i, img in enumerate(valid_images):
+                        import shutil
+                        ext = Path(img).suffix
+                        dest = str(slides_dir / f"frame_{i:03d}{ext}")
+                        shutil.copy2(img, dest)
+
+                    from video.editor import create_slideshow
+                    video_path = create_slideshow(
+                        str(slides_dir),
+                        audio_path=audio_path,
+                        output_path=str(VIDEO_OUTPUT_DIR / "fallback_slideshow.mp4"),
+                        duration_per_frame=10,
+                    )
+                    self.artifacts["final_video"] = video_path
+                    return
+                except Exception as e:
+                    print(f"  [compose] Fallback slideshow also failed: {e}")
+
+        # Last resort: audio-only video
+        if audio_path:
             try:
+                from video.editor import compose_video
                 result = compose_video(
-                    video_path=video_source,
-                    audio_path=audio_source,
+                    audio_path=audio_path,
                     title=title,
                     output_path=output_path,
                     resolution=self.video_resolution,
                 )
                 self.artifacts["final_video"] = result
             except Exception as e:
-                print(f"  [compose] WARNING: Video composition failed: {e}")
-                # Try simpler mux
-                if video_source and audio_source:
-                    self._mux_audio_video(video_source, audio_source, output_path)
-                    self.artifacts["final_video"] = output_path
-                elif video_source:
-                    self.artifacts["final_video"] = video_source
-        elif audio_source:
-            # Audio-only → create video with black screen + audio
-            output_path = str(VIDEO_OUTPUT_DIR / "final_video.mp4")
-            editor = VideoEditor()
-            editor.add_audio(audio_source)
-            result = editor.render(output_path=output_path, resolution=self.video_resolution)
-            self.artifacts["final_video"] = result
-
-        if not self.artifacts.get("final_video"):
-            raise RuntimeError("Failed to compose any video output")
-
-        print(f"  [compose] Final video: {self.artifacts['final_video']}")
+                print(f"  [compose] Even audio-only video failed: {e}")
 
     def _step_publish(self, **kwargs):
         """Publish the final video to configured platforms."""
         video_path = self.artifacts.get("final_video")
         if not video_path:
-            raise RuntimeError("No final video to publish")
+            print("  [publish] No final video to publish")
+            return
 
         publishing = self.plan.get("publishing", {})
         published_to = []
 
         # YouTube
         if "youtube" in publishing and os.environ.get("YOUTUBE_ENABLED"):
-            try:
-                result = self._publish_youtube(video_path, publishing["youtube"])
-                published_to.append({"platform": "youtube", "result": result})
-            except Exception as e:
-                print(f"  [publish] YouTube failed: {e}")
-                published_to.append({"platform": "youtube", "error": str(e)})
+            published_to.append({
+                "platform": "youtube",
+                "error": "Browser automation not available in this deployment"
+            })
 
         # TikTok
         if "tiktok" in publishing and os.environ.get("TIKTOK_ENABLED"):
-            try:
-                result = self._publish_tiktok(video_path, publishing["tiktok"])
-                published_to.append({"platform": "tiktok", "result": result})
-            except Exception as e:
-                print(f"  [publish] TikTok failed: {e}")
-                published_to.append({"platform": "tiktok", "error": str(e)})
+            published_to.append({
+                "platform": "tiktok",
+                "error": "Browser automation not available in this deployment"
+            })
 
-        # X (Twitter)
+        # X
         if "x" in publishing and os.environ.get("X_ENABLED"):
-            try:
-                result = self._publish_x(video_path, publishing["x"])
-                published_to.append({"platform": "x", "result": result})
-            except Exception as e:
-                print(f"  [publish] X/Twitter failed: {e}")
-                published_to.append({"platform": "x", "error": str(e)})
+            published_to.append({
+                "platform": "x",
+                "error": "Browser automation not available in this deployment"
+            })
 
         self.artifacts["published_to"] = published_to
 
-    def _publish_youtube(self, video_path, config):
-        """Upload video to YouTube Studio via browser automation.
+    def _create_all_placeholders(self, scenes):
+        """Create gradient placeholder images for all scenes.
 
-        Requires the user to be logged into YouTube in their Chrome profile.
-        See agent-workspace/domain-skills/youtube/upload.md for the full flow.
+        Args:
+            scenes: List of scene dicts.
+
+        Returns:
+            List of placeholder image paths.
         """
-        from browser_harness.helpers import (
-            goto_url, new_tab, wait_for_load, wait, click_at_xy,
-            type_text, fill_input, upload_file, page_info, js
-        )
-
-        # Navigate to YouTube Studio upload
-        new_tab("https://studio.youtube.com/channel/UC/videos/upload?filter=%5B%5D&sort=%7B%22columnType%22%3A%22date%22%2C%22sortOrder%22%3A%22DESCENDING%22%7D")
-        wait_for_load(timeout=20)
-        wait(3)
-
-        # Click the upload button / select files
-        upload_file('input[type="file"]', video_path)
-        wait(10)  # Processing time
-
-        # Fill in title
-        title = config.get("title", self.plan.get("title", ""))
-        try:
-            fill_input('#textbox[aria-label="Add a title that describes your video"]', title)
-        except Exception:
-            # Try alternative selectors
-            js(f'document.querySelector("[id=\'textbox\']").textContent = {json.dumps(title)}')
-
-        # Fill in description
-        description = config.get("description", "")
-        if description:
+        placeholders = []
+        for i, scene in enumerate(scenes):
+            text = scene.get("visual_instructions", scene.get("narration", f"Scene {i+1}"))[:80]
+            output_path = str(IMAGE_OUTPUT_DIR / f"placeholder_{i:03d}.png")
             try:
-                fill_input('#textbox[aria-label="Tell viewers about your video"]', description)
-            except Exception:
-                pass
-
-        # Set visibility
-        visibility = config.get("visibility", "public")
-        # Navigate to visibility tab
-        try:
-            js("document.querySelector('[tab-headers] :nth-child(3)').click()")
-            wait(1)
-            if visibility == "public":
-                js("document.querySelector('[label=\"Public\"] radio').click()")
-            elif visibility == "unlisted":
-                js("document.querySelector('[label=\"Unlisted\"] radio').click()")
-            elif visibility == "private":
-                js("document.querySelector('[label=\"Private\"] radio').click()")
-        except Exception:
-            pass
-
-        # Click publish
-        try:
-            js("document.querySelector('#publish-button').click()")
-        except Exception:
-            # Try the done button for scheduled/draft
-            js("document.querySelector('#done-button').click()")
-
-        wait(3)
-        return {"status": "uploaded", "title": title}
-
-    def _publish_tiktok(self, video_path, config):
-        """Upload video to TikTok via browser automation.
-
-        Requires the user to be logged into TikTok in their Chrome profile.
-        See agent-workspace/domain-skills/tiktok/upload.md for the full flow.
-        """
-        from browser_harness.helpers import (
-            goto_url, wait_for_load, wait, click_at_xy,
-            type_text, upload_file, page_info, js, press_key
-        )
-
-        # Navigate to TikTok Studio upload
-        goto_url("https://www.tiktok.com/tiktokstudio/upload?from=upload&lang=en")
-        wait_for_load(timeout=20)
-        wait(3)
-
-        # Dismiss stale draft banner if present
-        try:
-            js("""
-                var btns = document.querySelectorAll('button');
-                for (var b of btns) {
-                    if (b.textContent.includes('Discard')) { b.click(); break; }
-                }
-            """)
-            wait(1)
-        except Exception:
-            pass
-
-        # Upload file
-        upload_file('input[type="file"]', video_path)
-        wait(12)  # Processing time
-
-        # Set caption
-        caption = config.get("caption", self.plan.get("title", ""))
-        js("document.querySelector('div[contenteditable=\"true\"][role=\"combobox\"]').focus()")
-        press_key("End")
-        for _ in range(50):
-            press_key("Backspace")
-        type_text(caption)
-        press_key("Escape")
-
-        # Click Post button
-        try:
-            js("""
-                var btns = document.querySelectorAll('button');
-                for (var b of btns) {
-                    if (b.textContent.trim() === 'Post') { b.click(); break; }
-                }
-            """)
-        except Exception:
-            pass
-
-        wait(5)
-        return {"status": "uploaded", "caption": caption}
-
-    def _publish_x(self, video_path, config):
-        """Post to X (Twitter) via browser automation.
-
-        For video posts on X, this posts a tweet with a link to the YouTube video
-        (since X video upload via browser automation is complex and unreliable).
-        If the video was published to YouTube, link to it. Otherwise, post text only.
-        """
-        from browser_harness.helpers import (
-            goto_url, wait_for_load, wait, click_at_xy,
-            type_text, js, page_info
-        )
-
-        tweet_text = config.get("tweet", self.plan.get("title", ""))
-
-        # Add YouTube link if available
-        yt_result = next(
-            (p for p in self.artifacts.get("published_to", []) if p.get("platform") == "youtube"),
-            None
-        )
-        if yt_result and yt_result.get("result", {}).get("video_url"):
-            tweet_text += f" {yt_result['result']['video_url']}"
-
-        # Navigate to X compose
-        goto_url("https://x.com/compose/post")
-        wait_for_load(timeout=15)
-        wait(2)
-
-        # Find compose box and type
-        result = js('''
-            var el = document.querySelector("[data-testid='tweetTextarea_0']");
-            if (!el) return null;
-            var r = el.getBoundingClientRect();
-            return JSON.stringify({x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)});
-        ''')
-
-        if result:
-            import json as _json
-            pos = _json.loads(result)
-            click_at_xy(pos["x"], pos["y"])
-            type_text(tweet_text)
-
-            # Click Post button
-            btn = js('''
-                var b = document.querySelector("[data-testid='tweetButtonInline']")
-                     || document.querySelector("[data-testid='tweetButton']");
-                if (!b) return null;
-                var r = b.getBoundingClientRect();
-                return JSON.stringify({x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)});
-            ''')
-            if btn:
-                pos = _json.loads(btn)
-                click_at_xy(pos["x"], pos["y"])
-                wait(2)
-
-        return {"status": "posted", "text": tweet_text}
+                path = create_gradient_placeholder(
+                    text=text,
+                    output_path=output_path,
+                    scene_number=i + 1,
+                )
+                placeholders.append(path)
+            except Exception as e:
+                print(f"  [visuals] WARNING: Placeholder failed for scene {i+1}: {e}")
+                placeholders.append(None)
+        return placeholders
 
     # --- Utility methods ---
 
@@ -563,13 +414,12 @@ class PlanExecutor:
             "ffprobe", "-v", "quiet",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
-            path
+            path,
         ]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             return float(result.stdout.strip())
         except Exception:
-            # Estimate from file size (very rough)
             return 10.0
 
     def _concatenate_audio_files(self, paths, output_path):
@@ -581,7 +431,7 @@ class PlanExecutor:
 
         cmd = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_file, "-c", "copy", output_path
+            "-i", concat_file, "-c", "copy", output_path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -592,26 +442,12 @@ class PlanExecutor:
         except Exception:
             pass
 
-    def _mux_audio_video(self, video_path, audio_path, output_path):
-        """Simple audio-video multiplexing with ffmpeg."""
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-i", audio_path,
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            output_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Mux failed: {result.stderr[-500:]}")
-
 
 # --- Module-level convenience ---
 
-def execute_plan(plan=None, plan_path=None, tts_voice="alloy", publish=True,
-                 video_resolution="1080p", headless=False):
+def execute_plan(plan=None, plan_path=None, tts_voice="mimo_default", publish=True,
+                 video_resolution="720p", visual_style="cinematic",
+                 visual_mode="ai_images"):
     """Execute a content plan end-to-end.
 
     Args:
@@ -620,13 +456,15 @@ def execute_plan(plan=None, plan_path=None, tts_voice="alloy", publish=True,
         tts_voice: TTS voice to use.
         publish: Whether to publish after composing.
         video_resolution: Output video resolution.
-        headless: Skip browser recording, use slideshow mode.
+        visual_style: Visual style for AI image generation.
+        visual_mode: Visual source mode ("ai_images", "stock_videos", "ai_plus_stock").
 
     Returns:
         Dict with execution results.
     """
     executor = PlanExecutor(
         plan=plan, plan_path=plan_path,
-        tts_voice=tts_voice, video_resolution=video_resolution
+        tts_voice=tts_voice, video_resolution=video_resolution,
+        visual_style=visual_style, visual_mode=visual_mode,
     )
-    return executor.execute(publish=publish, headless=headless)
+    return executor.execute(publish=publish)
